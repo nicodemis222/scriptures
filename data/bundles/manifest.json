@@ -1,0 +1,95 @@
+{
+  "bundles": [
+    {
+      "id": "ot",
+      "name": "Old Testament",
+      "volume_id": 1,
+      "filename": "ot.sqlite",
+      "size_bytes": 10919936,
+      "verse_count": 23147,
+      "version": 1
+    },
+    {
+      "id": "nt",
+      "name": "New Testament",
+      "volume_id": 2,
+      "filename": "nt.sqlite",
+      "size_bytes": 3280896,
+      "verse_count": 7953,
+      "version": 1
+    },
+    {
+      "id": "bom",
+      "name": "Book of Mormon",
+      "volume_id": 3,
+      "filename": "bom.sqlite",
+      "size_bytes": 4280320,
+      "verse_count": 6604,
+      "version": 1
+    },
+    {
+      "id": "dc",
+      "name": "Doctrine and Covenants",
+      "volume_id": 4,
+      "filename": "dc.sqlite",
+      "size_bytes": 2048000,
+      "verse_count": 3654,
+      "version": 1
+    },
+    {
+      "id": "pgp",
+      "name": "Pearl of Great Price",
+      "volume_id": 5,
+      "filename": "pgp.sqlite",
+      "size_bytes": 491520,
+      "verse_count": 635,
+      "version": 1
+    },
+    {
+      "id": "coptic",
+      "name": "Coptic Bible",
+      "volume_id": 200,
+      "filename": "coptic.sqlite",
+      "size_bytes": 3469312,
+      "verse_count": 6325,
+      "version": 1
+    },
+    {
+      "id": "dss",
+      "name": "Dead Sea Scrolls",
+      "volume_id": 300,
+      "filename": "dss.sqlite",
+      "size_bytes": 565248,
+      "verse_count": 895,
+      "version": 1
+    },
+    {
+      "id": "russian",
+      "name": "Russian Orthodox Bible",
+      "volume_id": 400,
+      "filename": "russian.sqlite",
+      "size_bytes": 2605056,
+      "verse_count": 5223,
+      "version": 1
+    },
+    {
+      "id": "aw",
+      "name": "Ancient Witnesses",
+      "volume_id": 500,
+      "filename": "aw.sqlite",
+      "size_bytes": 102400,
+      "verse_count": 73,
+      "version": 1
+    },
+    {
+      "id": "hymns",
+      "name": "LDS Hymnal",
+      "volume_id": null,
+      "filename": "hymns.sqlite",
+      "size_bytes": 143360,
+      "verse_count": 317,
+      "version": 1
+    }
+  ],
+  "version": 1
+}
