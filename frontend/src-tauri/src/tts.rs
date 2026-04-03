@@ -8,6 +8,7 @@ pub struct TtsState {
     pub process: Mutex<Option<Child>>,
     pub paused: Mutex<bool>,
     pub prefetch: Mutex<Option<Child>>,
+    pub vibevoice_server: Mutex<Option<Child>>,
 }
 
 impl TtsState {
@@ -16,6 +17,7 @@ impl TtsState {
             process: Mutex::new(None),
             paused: Mutex::new(false),
             prefetch: Mutex::new(None),
+            vibevoice_server: Mutex::new(None),
         }
     }
 }
@@ -57,8 +59,27 @@ pub fn list_voices() -> Result<Value, String> {
         return Ok(json!([]));
     }
 
-    let data: Value = serde_json::from_slice(&output.stdout).unwrap_or(json!([]));
-    Ok(data)
+    let data: Value = serde_json::from_slice(&output.stdout).unwrap_or(json!({}));
+    // Server returns {"voices": [...], "default": "..."} — extract the array
+    // and normalize field names for the frontend
+    if let Some(voices_arr) = data.get("voices").and_then(|v| v.as_array()) {
+        let normalized: Vec<Value> = voices_arr
+            .iter()
+            .map(|v| {
+                json!({
+                    "name": v.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                    "voice_id": v.get("id").and_then(|n| n.as_str()).unwrap_or(""),
+                    "description": v.get("description").and_then(|n| n.as_str()).unwrap_or(""),
+                    "language": v.get("language").and_then(|n| n.as_str()).unwrap_or("en"),
+                    "locale": "vibevoice",
+                    "engine": "vibevoice",
+                })
+            })
+            .collect();
+        Ok(json!(normalized))
+    } else {
+        Ok(json!([]))
+    }
 }
 
 /// Start prefetching audio for a chapter in background.
@@ -98,7 +119,7 @@ pub fn prefetch_audio(
             "120",
             "-X",
             "POST",
-            "http://localhost:8095/stream",
+            "http://localhost:8095/synthesize",
             "-H",
             "Content-Type: application/json",
             "-d",
@@ -182,7 +203,7 @@ pub fn read_aloud(
                 "120",
                 "-X",
                 "POST",
-                "http://localhost:8095/stream",
+                "http://localhost:8095/synthesize",
                 "-H",
                 "Content-Type: application/json",
                 "-d",
@@ -432,6 +453,16 @@ const VIBEVOICE_BINARY_URL: &str =
     "https://ark-data-bundles.s3.us-west-2.amazonaws.com/vibevoice-tts-macos-arm64";
 
 fn vibevoice_binary_path() -> std::path::PathBuf {
+    // Check if bundled inside the app first
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let bundled = exe_dir.join("../Resources/vibevoice/vibevoice-tts");
+            if bundled.exists() {
+                return bundled;
+            }
+        }
+    }
+    // Fall back to user-downloaded location
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     std::path::PathBuf::from(home)
         .join(".scriptures")
@@ -494,9 +525,30 @@ pub fn install_vibevoice() -> Result<Value, String> {
     Ok(json!({"status": "installed", "path": path.to_string_lossy()}))
 }
 
+/// Cleanup: kill VibeVoice server, TTS process, prefetch on drop
+impl Drop for TtsState {
+    fn drop(&mut self) {
+        if let Ok(mut server) = self.vibevoice_server.lock() {
+            if let Some(ref mut child) = *server {
+                let _ = child.kill();
+            }
+        }
+        if let Ok(mut proc) = self.process.lock() {
+            if let Some(ref mut child) = *proc {
+                let _ = child.kill();
+            }
+        }
+        if let Ok(mut pf) = self.prefetch.lock() {
+            if let Some(ref mut child) = *pf {
+                let _ = child.kill();
+            }
+        }
+    }
+}
+
 /// Start VibeVoice server from the downloaded binary
 #[tauri::command]
-pub fn start_vibevoice() -> Result<Value, String> {
+pub fn start_vibevoice(tts: State<TtsState>) -> Result<Value, String> {
     if vibevoice_available() {
         return Ok(json!({"status": "already_running"}));
     }
@@ -506,11 +558,29 @@ pub fn start_vibevoice() -> Result<Value, String> {
         return Err("VibeVoice not installed. Click 'Install Voice Engine' first.".to_string());
     }
 
-    let _child = Command::new(&path)
+    // Set voices dir relative to the binary
+    let voices_dir = path.parent().unwrap_or(&path).join("voices");
+    // Kill any existing server first
+    {
+        let mut server = tts.vibevoice_server.lock().map_err(|e| e.to_string())?;
+        if let Some(ref mut child) = *server {
+            let _ = child.kill();
+        }
+        *server = None;
+    }
+
+    let child = Command::new(&path)
+        .env("VOICES_DIR", voices_dir.to_str().unwrap_or(""))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to start VibeVoice: {}", e))?;
+
+    // Store the server process for cleanup on app exit
+    {
+        let mut server = tts.vibevoice_server.lock().map_err(|e| e.to_string())?;
+        *server = Some(child);
+    }
 
     // Wait for model to load
     for _ in 0..30 {
