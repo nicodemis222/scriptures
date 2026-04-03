@@ -425,3 +425,100 @@ pub fn pull_ollama_model(model: String) -> Result<Value, String> {
         ))
     }
 }
+
+// ── VibeVoice Server Management ──
+
+const VIBEVOICE_BINARY_URL: &str =
+    "https://ark-data-bundles.s3.us-west-2.amazonaws.com/vibevoice-tts-macos-arm64";
+
+fn vibevoice_binary_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home)
+        .join(".scriptures")
+        .join("vibevoice-tts")
+}
+
+/// Check if VibeVoice binary is downloaded
+#[tauri::command]
+pub fn is_vibevoice_installed() -> Result<Value, String> {
+    let path = vibevoice_binary_path();
+    let installed = path.exists()
+        && path
+            .metadata()
+            .map(|m| m.len() > 1_000_000)
+            .unwrap_or(false);
+    let running = vibevoice_available();
+    Ok(json!({"installed": installed, "running": running, "path": path.to_string_lossy()}))
+}
+
+/// Download VibeVoice binary from S3 (one-time, ~328 MB)
+#[tauri::command]
+pub fn install_vibevoice() -> Result<Value, String> {
+    let path = vibevoice_binary_path();
+    let dir = path.parent().ok_or("Invalid path")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create dir: {}", e))?;
+
+    // Check if already downloaded
+    if path.exists()
+        && path
+            .metadata()
+            .map(|m| m.len() > 1_000_000)
+            .unwrap_or(false)
+    {
+        return Ok(json!({"status": "already_installed"}));
+    }
+
+    // Download from S3
+    let output = Command::new("curl")
+        .args([
+            "-fSL",
+            "--progress-bar",
+            "-o",
+            path.to_str().unwrap_or(""),
+            VIBEVOICE_BINARY_URL,
+        ])
+        .output()
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    if !output.status.success() {
+        return Err("Failed to download VibeVoice binary".to_string());
+    }
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    Ok(json!({"status": "installed", "path": path.to_string_lossy()}))
+}
+
+/// Start VibeVoice server from the downloaded binary
+#[tauri::command]
+pub fn start_vibevoice() -> Result<Value, String> {
+    if vibevoice_available() {
+        return Ok(json!({"status": "already_running"}));
+    }
+
+    let path = vibevoice_binary_path();
+    if !path.exists() {
+        return Err("VibeVoice not installed. Click 'Install Voice Engine' first.".to_string());
+    }
+
+    let _child = Command::new(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start VibeVoice: {}", e))?;
+
+    // Wait for model to load
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if vibevoice_available() {
+            return Ok(json!({"status": "started"}));
+        }
+    }
+
+    Ok(json!({"status": "starting"}))
+}

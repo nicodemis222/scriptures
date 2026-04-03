@@ -143,6 +143,19 @@ export async function listVoices(): Promise<VoiceInfo[]> {
   return invoke('list_voices');
 }
 
+// VibeVoice management
+export async function isVibevoiceInstalled(): Promise<{ installed: boolean; running: boolean; path: string }> {
+  return invoke('is_vibevoice_installed');
+}
+
+export async function installVibevoice(): Promise<{ status: string }> {
+  return invoke('install_vibevoice');
+}
+
+export async function startVibevoice(): Promise<{ status: string }> {
+  return invoke('start_vibevoice');
+}
+
 export async function prefetchAudio(text: string, voice?: string): Promise<void> {
   const params: Record<string, unknown> = { text };
   if (voice) params.voice = voice;
