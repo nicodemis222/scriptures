@@ -1,0 +1,35 @@
+# Dependencies
+frontend/node_modules/
+frontend/dist/
+
+# Rust build
+frontend/src-tauri/target/
+
+# Database backups
+data/*.backup*
+data/bundles/
+
+# macOS
+.DS_Store
+*.dmg
+
+# Temp files
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.local
+
+# VibeVoice model cache
+services/vibevoice-tts/voices/*.pt
+services/vibevoice-tts/__pycache__/
+
+# App data
+scriptures.db.backup
+scriptures.db-wal
+scriptures.db-shm
