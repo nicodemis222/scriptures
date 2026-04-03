@@ -1,5 +1,4 @@
 use serde_json::{json, Value};
-use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use tauri::State;
@@ -244,6 +243,11 @@ pub fn read_aloud(
 }
 
 fn spawn_system_tts(text: &str, rate: f32, voice: Option<&str>) -> Result<Child, String> {
+    // Write text to temp file to avoid pipe blocking on large chapters
+    let temp_path = std::env::temp_dir().join("scriptures_tts_text.txt");
+    std::fs::write(&temp_path, text)
+        .map_err(|e| format!("Failed to write TTS text file: {}", e))?;
+
     if cfg!(target_os = "macos") {
         let mut cmd = Command::new("say");
         cmd.arg("-r").arg(rate.to_string());
@@ -252,24 +256,19 @@ fn spawn_system_tts(text: &str, rate: f32, voice: Option<&str>) -> Result<Child,
                 cmd.arg("-v").arg(v);
             }
         }
-        cmd.stdin(Stdio::piped());
-        let mut child = cmd
+        // Use -f to read from file (non-blocking, handles any text length)
+        cmd.arg("-f").arg(&temp_path);
+        let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to start TTS: {}", e))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
         Ok(child)
     } else if cfg!(target_os = "linux") {
         let mut cmd = Command::new("espeak");
         cmd.arg("-s").arg(rate.to_string());
-        cmd.stdin(Stdio::piped());
-        let mut child = cmd
+        cmd.arg("-f").arg(&temp_path);
+        let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to start TTS (espeak): {}", e))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
         Ok(child)
     } else {
         Err("TTS not supported on this platform".to_string())
