@@ -130,6 +130,8 @@ export interface VoiceInfo {
   locale: string;
   engine?: string;
   description?: string;
+  voice_id?: string;
+  language?: string;
 }
 
 export interface TtsStatus {
@@ -139,6 +141,16 @@ export interface TtsStatus {
 
 export async function listVoices(): Promise<VoiceInfo[]> {
   return invoke('list_voices');
+}
+
+export async function prefetchAudio(text: string, voice?: string): Promise<void> {
+  const params: Record<string, unknown> = { text };
+  if (voice) params.voice = voice;
+  return invoke('prefetch_audio', params);
+}
+
+export async function isPrefetchReady(): Promise<boolean> {
+  return invoke('is_prefetch_ready');
 }
 
 export async function readAloud(text: string, rate?: number, voice?: string): Promise<void> {

@@ -54,6 +54,8 @@ fn main() {
             commands::get_all_notes,
             // TTS
             tts::list_voices,
+            tts::prefetch_audio,
+            tts::is_prefetch_ready,
             tts::read_aloud,
             tts::pause_reading,
             tts::resume_reading,

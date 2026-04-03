@@ -1,5 +1,8 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { readAloud, pauseReading, resumeReading, stopReading, isReading, getSetting, setSetting, listVoices } from '../hooks/useScriptures';
+import {
+  readAloud, pauseReading, resumeReading, stopReading, isReading,
+  getSetting, setSetting, listVoices, prefetchAudio, isPrefetchReady,
+} from '../hooks/useScriptures';
 import type { VerseResult } from '../types/scriptures';
 import type { VoiceInfo } from '../hooks/useScriptures';
 import { PlayIcon, PauseIcon, StopIcon, SpeakerIcon } from './Icons';
@@ -14,10 +17,13 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
   const [playing, setPlaying] = useState(false);
   const [paused, setPaused] = useState(false);
   const [voices, setVoices] = useState<VoiceInfo[]>([]);
-  const [selectedVoice, setSelectedVoice] = useState('default');
+  const [selectedVoice, setSelectedVoice] = useState('en-Emma_woman');
   const [showPlayer, setShowPlayer] = useState(false);
+  const [preparing, setPreparing] = useState(false);
+  const [prefetched, setPrefetched] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Load voices on mount
   useEffect(() => {
     void (async () => {
       try {
@@ -27,14 +33,42 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
         ]);
         setVoices(voiceList);
         if (saved) setSelectedVoice(saved);
-      } catch { /* voices unavailable */ }
+      } catch { /* unavailable */ }
     })();
   }, []);
+
+  // Prefetch audio when chapter changes
+  useEffect(() => {
+    if (verses.length === 0) return;
+    setPrefetched(false);
+
+    const fullText = verses.map(v => v.text).join('. ');
+    void prefetchAudio(fullText, selectedVoice);
+
+    // Poll for prefetch readiness
+    const checkInterval = setInterval(async () => {
+      try {
+        const ready = await isPrefetchReady();
+        if (ready) {
+          setPrefetched(true);
+          clearInterval(checkInterval);
+        }
+      } catch { /* ignore */ }
+    }, 500);
+
+    return () => clearInterval(checkInterval);
+  }, [bookTitle, chapterNumber, verses, selectedVoice]);
 
   const handleVoiceChange = useCallback((voice: string) => {
     setSelectedVoice(voice);
     void setSetting('ttsVoice', voice);
-  }, []);
+    // Re-prefetch with new voice
+    if (verses.length > 0) {
+      setPrefetched(false);
+      const fullText = verses.map(v => v.text).join('. ');
+      void prefetchAudio(fullText, voice);
+    }
+  }, [verses]);
 
   const clearPoll = useCallback(() => {
     if (pollRef.current) {
@@ -43,14 +77,12 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
     }
   }, []);
 
-  // Start polling for playback status
   const startPoll = useCallback(() => {
     clearPoll();
     pollRef.current = setInterval(async () => {
       try {
         const status = await isReading();
         if (!status.playing && !status.paused) {
-          // Playback finished naturally
           setPlaying(false);
           setPaused(false);
           setShowPlayer(false);
@@ -70,41 +102,37 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
   const handlePlay = useCallback(async () => {
     if (verses.length === 0) return;
 
+    setPreparing(true);
+    setShowPlayer(true);
+
     try {
       const rateSetting = await getSetting('ttsRate');
       const rate = rateSetting ? parseInt(rateSetting, 10) : 175;
-      const voice = selectedVoice !== 'default' ? selectedVoice : undefined;
+      const fullText = verses.map(v => v.text).join('. ');
 
-      // Send entire chapter as one block — natural flow, no gaps
-      const fullText = verses
-        .map(v => v.text)
-        .join('. ');  // Period+space gives natural pause between verses
-
-      await readAloud(fullText, rate, voice);
+      await readAloud(fullText, rate, selectedVoice);
       setPlaying(true);
       setPaused(false);
-      setShowPlayer(true);
+      setPreparing(false);
       startPoll();
     } catch (err) {
       console.error('ReadAloud failed:', err);
+      setPreparing(false);
       setPlaying(false);
+      setShowPlayer(false);
     }
   }, [verses, selectedVoice, startPoll]);
 
   const handlePause = useCallback(async () => {
-    try {
-      await pauseReading();
-      setPaused(true);
-      setPlaying(false);
-    } catch { /* ignore */ }
+    try { await pauseReading(); } catch { /* ignore */ }
+    setPaused(true);
+    setPlaying(false);
   }, []);
 
   const handleResume = useCallback(async () => {
-    try {
-      await resumeReading();
-      setPaused(false);
-      setPlaying(true);
-    } catch { /* ignore */ }
+    try { await resumeReading(); } catch { /* ignore */ }
+    setPaused(false);
+    setPlaying(true);
   }, []);
 
   const handleStop = useCallback(async () => {
@@ -113,9 +141,9 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
     setPlaying(false);
     setPaused(false);
     setShowPlayer(false);
+    setPreparing(false);
   }, [clearPoll]);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       clearPoll();
@@ -123,56 +151,64 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
     };
   }, [clearPoll]);
 
-  // Reset when chapter changes
+  // Reset on chapter change
   useEffect(() => {
     clearPoll();
     void stopReading().catch(() => {});
     setPlaying(false);
     setPaused(false);
     setShowPlayer(false);
+    setPreparing(false);
   }, [bookTitle, chapterNumber, clearPoll]);
 
   return (
     <>
-      {/* Inline play button (in header area) */}
+      {/* Inline controls */}
       {!showPlayer && (
         <div className="read-aloud-controls">
           <SpeakerIcon size={16} />
-          {voices.length > 1 && (
+          {voices.length > 0 && (
             <select
               className="voice-select"
               value={selectedVoice}
               onChange={(e) => handleVoiceChange(e.target.value)}
-              title="Select voice"
             >
-              <option value="default">Default Voice</option>
               {voices.map((v) => (
-                <option key={v.name} value={v.name}>
-                  {v.name} {v.engine === 'vibevoice' ? '(Neural)' : ''}
+                <option key={v.voice_id || v.name} value={v.voice_id || v.name}>
+                  {v.description || v.name}
                 </option>
               ))}
             </select>
           )}
-          <button className="read-aloud-btn" onClick={() => void handlePlay()} disabled={verses.length === 0}
-            title={`Read ${bookTitle} ${chapterNumber} aloud`}>
+          <button
+            className="read-aloud-btn"
+            onClick={() => void handlePlay()}
+            disabled={verses.length === 0}
+            title={prefetched ? 'Play (ready)' : 'Play (will prepare first)'}
+          >
             <PlayIcon size={14} />
+            {prefetched && <span style={{ fontSize: 8, marginLeft: 2, color: 'var(--accent)' }}>●</span>}
           </button>
         </div>
       )}
 
-      {/* Sticky floating player bar */}
+      {/* Sticky player bar */}
       {showPlayer && (
         <div className="tts-player">
           <div className="tts-player-inner">
             <div className="tts-player-info">
               <span className="tts-player-title">{bookTitle} {chapterNumber}</span>
               <span className="tts-player-verse">
-                {playing ? 'Playing...' : paused ? 'Paused' : 'Ready'}
+                {preparing ? 'Preparing audio...' : playing ? 'Playing' : paused ? 'Paused' : 'Ready'}
               </span>
             </div>
 
             <div className="tts-player-controls">
-              {playing ? (
+              {preparing ? (
+                <div className="tts-player-main" style={{ opacity: 0.5 }}>
+                  <SpeakerIcon size={18} className="playing" />
+                </div>
+              ) : playing ? (
                 <button onClick={() => void handlePause()} className="tts-player-main" title="Pause">
                   <PauseIcon size={18} />
                 </button>
@@ -188,22 +224,7 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
             </div>
 
             <div className="tts-player-right">
-              {voices.length > 1 && (
-                <select
-                  className="voice-select"
-                  value={selectedVoice}
-                  onChange={(e) => handleVoiceChange(e.target.value)}
-                  disabled={playing}
-                >
-                  <option value="default">Default</option>
-                  {voices.map((v) => (
-                    <option key={v.name} value={v.name}>
-                      {v.name} {v.engine === 'vibevoice' ? '(Neural)' : ''}
-                    </option>
-                  ))}
-                </select>
-              )}
-              <button onClick={() => void handleStop()} className="tts-player-close" title="Close player">
+              <button onClick={() => void handleStop()} className="tts-player-close" title="Close">
                 <StopIcon size={14} />
               </button>
             </div>
