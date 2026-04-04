@@ -33,3 +33,8 @@ services/vibevoice-tts/__pycache__/
 scriptures.db.backup
 scriptures.db-wal
 scriptures.db-shm
+services/piper-tts/build/
+services/piper-tts/dist/
+services/piper-tts/models/*.onnx
+services/vibevoice-tts/build/
+services/vibevoice-tts/dist/
