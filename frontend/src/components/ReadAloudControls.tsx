@@ -17,7 +17,7 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
   const [playing, setPlaying] = useState(false);
   const [paused, setPaused] = useState(false);
   const [voices, setVoices] = useState<VoiceInfo[]>([]);
-  const [selectedVoice, setSelectedVoice] = useState('en-Emma_woman');
+  const [selectedVoice, setSelectedVoice] = useState('en_US-lessac-high');
   const [showPlayer, setShowPlayer] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const [prefetched, setPrefetched] = useState(false);

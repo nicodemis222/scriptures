@@ -25,9 +25,8 @@ data/bundles/
 .env
 .env.local
 
-# VibeVoice model cache
-services/vibevoice-tts/voices/*.pt
-services/vibevoice-tts/__pycache__/
+# Piper TTS build artifacts
+services/piper-tts/__pycache__/
 
 # App data
 scriptures.db.backup
@@ -36,5 +35,5 @@ scriptures.db-shm
 services/piper-tts/build/
 services/piper-tts/dist/
 services/piper-tts/models/*.onnx
-services/vibevoice-tts/build/
-services/vibevoice-tts/dist/
+# Legacy VibeVoice (removed)
+services/vibevoice-tts/

@@ -7,7 +7,7 @@ pub struct TtsState {
     pub process: Mutex<Option<Child>>,
     pub paused: Mutex<bool>,
     pub prefetch: Mutex<Option<Child>>,
-    pub vibevoice_server: Mutex<Option<Child>>,
+    pub piper_server: Mutex<Option<Child>>,
 }
 
 impl TtsState {
@@ -16,14 +16,14 @@ impl TtsState {
             process: Mutex::new(None),
             paused: Mutex::new(false),
             prefetch: Mutex::new(None),
-            vibevoice_server: Mutex::new(None),
+            piper_server: Mutex::new(None),
         }
     }
 }
 
 impl Drop for TtsState {
     fn drop(&mut self) {
-        for mutex in [&self.vibevoice_server, &self.process, &self.prefetch] {
+        for mutex in [&self.piper_server, &self.process, &self.prefetch] {
             if let Ok(mut guard) = mutex.lock() {
                 if let Some(ref mut child) = *guard {
                     let _ = child.kill();
@@ -35,36 +35,76 @@ impl Drop for TtsState {
 
 const PLAYBACK_SCRIPT: &str = "/tmp/scriptures_tts_play.sh";
 const PREFETCH_DIR: &str = "/tmp/scriptures_tts_chunks";
+const TTS_PORT: u16 = 8095;
 
-fn vibevoice_available() -> bool {
+fn piper_server_available() -> bool {
     Command::new("curl")
         .args([
             "-s",
             "--connect-timeout",
             "1",
-            "http://localhost:8095/health",
+            &format!("http://localhost:{}/health", TTS_PORT),
         ])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-fn vibevoice_binary_path() -> std::path::PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            let bundled = exe_dir.join("../Resources/vibevoice/vibevoice-tts");
-            if bundled.exists() {
-                return bundled;
-            }
-        }
-    }
+/// Find the Piper TTS server.py and models directory.
+/// Returns (python_path, server_py_path, model_dir)
+fn piper_server_paths() -> (String, String, String) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    std::path::PathBuf::from(home)
-        .join(".scriptures")
-        .join("vibevoice-tts")
+
+    // Check for venv in ~/.scriptures/piper-env/
+    let venv_python = format!("{}/.scriptures/piper-env/bin/python", home);
+    let venv_exists = std::path::Path::new(&venv_python).exists();
+
+    let python = if venv_exists {
+        venv_python
+    } else {
+        "python3".to_string()
+    };
+
+    // Server script location: check bundled first, then project, then ~/.scriptures
+    let server_locations = vec![
+        // Inside .app bundle
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.join("../Resources/piper/server.py")))
+            .unwrap_or_default(),
+        // Development: project services dir
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("services/piper-tts/server.py"))
+            .unwrap_or_default(),
+        // Fallback: home dir
+        std::path::PathBuf::from(&home)
+            .join(".scriptures")
+            .join("piper")
+            .join("server.py"),
+    ];
+
+    let server_py = server_locations
+        .iter()
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Model directory: next to server.py
+    let model_dir = if !server_py.is_empty() {
+        std::path::Path::new(&server_py)
+            .parent()
+            .map(|p| p.join("models").to_string_lossy().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    (python, server_py, model_dir)
 }
 
-/// Split text into sentences (~10-20 words each) for fast synthesis
+/// Split text into sentences for fast synthesis
 fn split_into_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut current = String::new();
@@ -87,7 +127,6 @@ fn split_into_sentences(text: &str) -> Vec<String> {
 }
 
 /// Generate a shell script that synthesizes sentences one at a time and plays each immediately.
-/// First audio within ~3 seconds. Subsequent sentences overlap synthesis + playback.
 fn generate_playback_script(sentences: &[String], voice: &str, rate: f32) -> String {
     let rate_mult = format!("{:.2}", rate / 175.0);
     let mut script = String::from("#!/bin/bash\nset -e\n");
@@ -97,29 +136,27 @@ fn generate_playback_script(sentences: &[String], voice: &str, rate: f32) -> Str
         let escaped = sentence.replace('\'', "'\\''");
         let wav_path = format!("{}/chunk_{:04}.wav", PREFETCH_DIR, i);
 
-        // Synthesize this sentence
         script.push_str(&format!(
-            "curl -sN -X POST http://localhost:8095/synthesize \\\n  -H 'Content-Type: application/json' \\\n  -d '{{\"text\":\"{}\",\"voice\":\"{}\"}}' \\\n  -o '{}' 2>/dev/null\n",
+            "curl -sN -X POST http://localhost:{}/synthesize \\\n  -H 'Content-Type: application/json' \\\n  -d '{{\"text\":\"{}\",\"voice\":\"{}\"}}' \\\n  -o '{}' 2>/dev/null\n",
+            TTS_PORT,
             escaped.replace('\"', "\\\"").replace('\n', " "),
             voice,
             wav_path,
         ));
 
-        // Play it immediately (blocks until done, then next sentence starts)
         script.push_str(&format!(
-            "[ -f '{}' ] && afplay -r {} '{}' 2>/dev/null\n",
-            wav_path, rate_mult, wav_path,
+            "[ -f '{}' ] && [ -s '{}' ] && afplay -r {} '{}' 2>/dev/null\n",
+            wav_path, wav_path, rate_mult, wav_path,
         ));
     }
 
-    // Cleanup
     script.push_str(&format!("rm -rf {}\n", PREFETCH_DIR));
     script
 }
 
 #[tauri::command]
 pub fn list_voices() -> Result<Value, String> {
-    if !vibevoice_available() {
+    if !piper_server_available() {
         return Ok(json!([]));
     }
 
@@ -128,7 +165,7 @@ pub fn list_voices() -> Result<Value, String> {
             "-s",
             "--connect-timeout",
             "2",
-            "http://localhost:8095/voices",
+            &format!("http://localhost:{}/voices", TTS_PORT),
         ])
         .output()
         .map_err(|e| e.to_string())?;
@@ -147,8 +184,8 @@ pub fn list_voices() -> Result<Value, String> {
                     "voice_id": v.get("id").and_then(|n| n.as_str()).unwrap_or(""),
                     "description": v.get("description").and_then(|n| n.as_str()).unwrap_or(""),
                     "language": v.get("language").and_then(|n| n.as_str()).unwrap_or("en"),
-                    "locale": "vibevoice",
-                    "engine": "vibevoice",
+                    "locale": "piper",
+                    "engine": "piper",
                 })
             })
             .collect();
@@ -158,7 +195,6 @@ pub fn list_voices() -> Result<Value, String> {
     }
 }
 
-/// Prefetch first sentence only (for near-instant first play)
 #[tauri::command]
 pub fn prefetch_audio(
     text: String,
@@ -173,18 +209,17 @@ pub fn prefetch_audio(
         *pf = None;
     }
 
-    if text.is_empty() || !vibevoice_available() {
+    if text.is_empty() || !piper_server_available() {
         return Ok(());
     }
 
-    // Only prefetch the FIRST sentence for fast start
     let sentences = split_into_sentences(&text);
     let first = sentences.first().cloned().unwrap_or_default();
     if first.is_empty() {
         return Ok(());
     }
 
-    let voice_id = voice.unwrap_or_else(|| "en-Emma_woman".to_string());
+    let voice_id = voice.unwrap_or_else(|| "en_US-lessac-high".to_string());
     let body = json!({"text": first, "voice": voice_id});
 
     let _ = std::fs::create_dir_all(PREFETCH_DIR);
@@ -199,7 +234,7 @@ pub fn prefetch_audio(
             "30",
             "-X",
             "POST",
-            "http://localhost:8095/synthesize",
+            &format!("http://localhost:{}/synthesize", TTS_PORT),
             "-H",
             "Content-Type: application/json",
             "-d",
@@ -224,8 +259,43 @@ pub fn is_prefetch_ready() -> Result<bool, String> {
     Ok(size > 1024)
 }
 
-/// Play chapter: sentence-by-sentence synthesis + playback.
-/// First audio within ~3 seconds. Each subsequent sentence synthesized while previous plays.
+/// Start Piper TTS server using venv Python + server.py
+fn auto_start_piper(tts: &State<TtsState>) -> bool {
+    let (python, server_py, model_dir) = piper_server_paths();
+    if server_py.is_empty() || !std::path::Path::new(&python).exists() {
+        return false;
+    }
+
+    // Kill any stale process on the port
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("lsof -ti:{} | xargs kill -9 2>/dev/null", TTS_PORT))
+        .output();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let child = Command::new(&python)
+        .arg(&server_py)
+        .env("TTS_PORT", TTS_PORT.to_string())
+        .env("MODEL_DIR", &model_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if let Ok(child) = child {
+        if let Ok(mut server) = tts.piper_server.lock() {
+            *server = Some(child);
+        }
+        // Wait for server to come up (model load takes a few seconds)
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if piper_server_available() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[tauri::command]
 pub fn read_aloud(
     text: String,
@@ -233,7 +303,7 @@ pub fn read_aloud(
     voice: Option<String>,
     tts: State<TtsState>,
 ) -> Result<(), String> {
-    // Kill existing
+    // Kill existing playback
     {
         let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
         if let Some(ref mut child) = *proc {
@@ -246,25 +316,25 @@ pub fn read_aloud(
         *p = false;
     }
 
-    if !vibevoice_available() {
-        return Err("VibeVoice server not running. Start it from Settings.".to_string());
+    // Auto-start Piper server if not running
+    if !piper_server_available() {
+        if !auto_start_piper(&tts) {
+            return Err("Piper TTS server not available. Install it from Settings.".to_string());
+        }
     }
 
     let rate_val = rate.unwrap_or(175.0).clamp(50.0, 500.0);
-    let voice_id = voice.unwrap_or_else(|| "en-Emma_woman".to_string());
+    let voice_id = voice.unwrap_or_else(|| "en_US-lessac-high".to_string());
 
-    // Split into sentences for fast first-audio
     let sentences = split_into_sentences(&text);
     if sentences.is_empty() {
         return Ok(());
     }
 
-    // Generate a shell script that synthesizes + plays sentence by sentence
     let script = generate_playback_script(&sentences, &voice_id, rate_val);
     std::fs::write(PLAYBACK_SCRIPT, &script)
         .map_err(|e| format!("Failed to write playback script: {}", e))?;
 
-    // Make executable and run
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -291,7 +361,6 @@ pub fn pause_reading(tts: State<TtsState>) -> Result<(), String> {
             Ok(None) => {
                 #[cfg(unix)]
                 unsafe {
-                    // SIGSTOP the entire process group (bash + curl + afplay)
                     libc::kill(-(child.id() as libc::pid_t), libc::SIGSTOP);
                 }
             }
@@ -342,7 +411,10 @@ pub fn stop_reading(tts: State<TtsState>) -> Result<(), String> {
     *proc = None;
     let mut p = tts.paused.lock().map_err(|e| e.to_string())?;
     *p = false;
-    // Cleanup temp files
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("pkill -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null")
+        .output();
     let _ = std::fs::remove_dir_all(PREFETCH_DIR);
     let _ = std::fs::remove_file(PLAYBACK_SCRIPT);
     Ok(())
@@ -370,97 +442,109 @@ pub fn is_reading(tts: State<TtsState>) -> Result<Value, String> {
     }
 }
 
-// ── VibeVoice Server Management ──
-
-const VIBEVOICE_BINARY_URL: &str =
-    "https://ark-data-bundles.s3.us-west-2.amazonaws.com/vibevoice-tts-macos-arm64";
+// ── Piper TTS Server Management ──
+// Note: Command names kept as is_vibevoice_installed/install_vibevoice/start_vibevoice
+// to maintain frontend API compatibility. They now manage Piper TTS.
 
 #[tauri::command]
 pub fn is_vibevoice_installed() -> Result<Value, String> {
-    let path = vibevoice_binary_path();
-    let installed = path.exists()
-        && path
-            .metadata()
-            .map(|m| m.len() > 1_000_000)
-            .unwrap_or(false);
-    let running = vibevoice_available();
-    Ok(json!({"installed": installed, "running": running, "path": path.to_string_lossy()}))
+    let (python, server_py, model_dir) = piper_server_paths();
+    let has_python = std::path::Path::new(&python).exists();
+    let has_server = !server_py.is_empty() && std::path::Path::new(&server_py).exists();
+    let has_models = !model_dir.is_empty() && std::path::Path::new(&model_dir).exists();
+    let installed = has_python && has_server && has_models;
+    let running = piper_server_available();
+    Ok(json!({
+        "installed": installed,
+        "running": running,
+        "path": server_py,
+    }))
 }
 
 #[tauri::command]
 pub fn install_vibevoice() -> Result<Value, String> {
-    let path = vibevoice_binary_path();
-    let dir = path.parent().ok_or("Invalid path")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create dir: {}", e))?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let venv_path = format!("{}/.scriptures/piper-env", home);
+    let venv_python = format!("{}/bin/python", venv_path);
 
-    if path.exists()
-        && path
-            .metadata()
-            .map(|m| m.len() > 1_000_000)
-            .unwrap_or(false)
-    {
-        return Ok(json!({"status": "already_installed"}));
+    // Check if already installed
+    if std::path::Path::new(&venv_python).exists() {
+        let check = Command::new(&venv_python)
+            .args(["-c", "import piper"])
+            .output();
+        if check.map(|o| o.status.success()).unwrap_or(false) {
+            return Ok(json!({"status": "already_installed"}));
+        }
     }
 
-    let output = Command::new("curl")
-        .args([
-            "-fSL",
-            "--progress-bar",
-            "-o",
-            path.to_str().unwrap_or(""),
-            VIBEVOICE_BINARY_URL,
-        ])
+    // Create venv
+    let output = Command::new("python3")
+        .args(["-m", "venv", &venv_path])
         .output()
-        .map_err(|e| format!("Download failed: {}", e))?;
-
+        .map_err(|e| format!("Failed to create venv: {}", e))?;
     if !output.status.success() {
-        return Err("Failed to download VibeVoice binary".to_string());
+        return Err("Failed to create Python venv".to_string());
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    // Install piper-tts
+    let pip = format!("{}/bin/pip", venv_path);
+    let output = Command::new(&pip)
+        .args(["install", "piper-tts"])
+        .output()
+        .map_err(|e| format!("pip install failed: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to install piper-tts: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
-    Ok(json!({"status": "installed", "path": path.to_string_lossy()}))
+    Ok(json!({"status": "installed", "path": venv_path}))
 }
 
 #[tauri::command]
 pub fn start_vibevoice(tts: State<TtsState>) -> Result<Value, String> {
-    if vibevoice_available() {
+    if piper_server_available() {
         return Ok(json!({"status": "already_running"}));
     }
 
-    let path = vibevoice_binary_path();
-    if !path.exists() {
-        return Err("VibeVoice not installed.".to_string());
+    let (python, server_py, model_dir) = piper_server_paths();
+    if server_py.is_empty() || !std::path::Path::new(&python).exists() {
+        return Err("Piper TTS not installed. Click Install first.".to_string());
     }
 
+    // Kill anything on the port first
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("lsof -ti:{} | xargs kill -9 2>/dev/null", TTS_PORT))
+        .output();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     {
-        let mut server = tts.vibevoice_server.lock().map_err(|e| e.to_string())?;
+        let mut server = tts.piper_server.lock().map_err(|e| e.to_string())?;
         if let Some(ref mut child) = *server {
             let _ = child.kill();
         }
         *server = None;
     }
 
-    let voices_dir = path.parent().unwrap_or(&path).join("voices");
-    let child = Command::new(&path)
-        .env("VOICES_DIR", voices_dir.to_str().unwrap_or(""))
+    let child = Command::new(&python)
+        .arg(&server_py)
+        .env("TTS_PORT", TTS_PORT.to_string())
+        .env("MODEL_DIR", &model_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("Failed to start VibeVoice: {}", e))?;
+        .map_err(|e| format!("Failed to start Piper TTS: {}", e))?;
 
     {
-        let mut server = tts.vibevoice_server.lock().map_err(|e| e.to_string())?;
+        let mut server = tts.piper_server.lock().map_err(|e| e.to_string())?;
         *server = Some(child);
     }
 
     for _ in 0..30 {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        if vibevoice_available() {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if piper_server_available() {
             return Ok(json!({"status": "started"}));
         }
     }

@@ -86,7 +86,7 @@ class Handler(BaseHTTPRequestHandler):
                             "language": lang,
                             "description": name,
                         })
-            self._json(200, {"voices": voices, "default": _voice_name})
+            self._json(200, {"voices": voices, "default": _default_voice_name})
         else:
             self.send_error(404)
 
@@ -146,7 +146,7 @@ def main():
         return
 
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[server] Listening on :{PORT} (model: {_voice_name})")
+    print(f"[server] Listening on :{PORT} (model: {_default_voice_name})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

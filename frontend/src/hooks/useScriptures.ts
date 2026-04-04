@@ -143,16 +143,16 @@ export async function listVoices(): Promise<VoiceInfo[]> {
   return invoke('list_voices');
 }
 
-// VibeVoice management
-export async function isVibevoiceInstalled(): Promise<{ installed: boolean; running: boolean; path: string }> {
+// Piper TTS management
+export async function isPiperInstalled(): Promise<{ installed: boolean; running: boolean; path: string }> {
   return invoke('is_vibevoice_installed');
 }
 
-export async function installVibevoice(): Promise<{ status: string }> {
+export async function installPiper(): Promise<{ status: string }> {
   return invoke('install_vibevoice');
 }
 
-export async function startVibevoice(): Promise<{ status: string }> {
+export async function startPiper(): Promise<{ status: string }> {
   return invoke('start_vibevoice');
 }
 
