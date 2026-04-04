@@ -20,28 +20,42 @@ PORT = int(os.environ.get("TTS_PORT", "8095"))
 MODEL_DIR = os.environ.get("MODEL_DIR", str(Path(__file__).parent / "models"))
 DEFAULT_MODEL = os.environ.get("TTS_MODEL", "en_US-lessac-high")
 
-_voice = None
-_voice_name = None
+_voices = {}  # cache: name -> PiperVoice
+_default_voice_name = None
 
 
-def load_voice(model_name=None):
-    global _voice, _voice_name
+def load_voice(model_name):
+    """Load a voice model, caching for reuse."""
     from piper import PiperVoice
 
-    model_name = model_name or DEFAULT_MODEL
+    if model_name in _voices:
+        return _voices[model_name]
+
     model_path = os.path.join(MODEL_DIR, f"{model_name}.onnx")
-
     if not os.path.exists(model_path):
-        print(f"[error] Model not found: {model_path}")
-        return False
+        return None
 
-    print(f"[startup] Loading model: {model_name}")
+    print(f"[load] Loading model: {model_name}")
     start = time.time()
-    _voice = PiperVoice.load(model_path)
+    voice = PiperVoice.load(model_path)
     elapsed = (time.time() - start) * 1000
-    _voice_name = model_name
-    print(f"[startup] Model loaded in {elapsed:.0f}ms")
-    return True
+    _voices[model_name] = voice
+    print(f"[load] {model_name} loaded in {elapsed:.0f}ms")
+    return voice
+
+
+def get_voice(requested_name=None):
+    """Get a voice by name, falling back to default."""
+    name = requested_name or _default_voice_name or DEFAULT_MODEL
+    voice = load_voice(name)
+    if voice:
+        return voice, name
+    # Fall back to default
+    if name != DEFAULT_MODEL:
+        voice = load_voice(DEFAULT_MODEL)
+        if voice:
+            return voice, DEFAULT_MODEL
+    return None, None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -50,11 +64,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
+            default_voice, _ = get_voice()
             self._json(200, {
                 "status": "ok",
                 "engine": "piper",
-                "model": _voice_name,
-                "sample_rate": _voice.config.sample_rate if _voice else 0,
+                "model": _default_voice_name,
+                "voices_loaded": len(_voices),
+                "sample_rate": default_voice.config.sample_rate if default_voice else 0,
             })
         elif self.path == "/voices":
             voices = []
@@ -87,14 +103,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400, "Missing text")
             return
 
-        if not _voice:
-            self.send_error(503, "Model not loaded")
+        voice_name = body.get("voice", None)
+        voice, used_name = get_voice(voice_name)
+        if not voice:
+            self.send_error(503, "No voice model available")
             return
 
         start = time.time()
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
-            _voice.synthesize_wav(text, wf)
+            voice.synthesize_wav(text, wf)
         wav_data = buf.getvalue()
         elapsed = (time.time() - start) * 1000
 
@@ -120,8 +138,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if not load_voice():
-        print(f"[error] Failed to load model. Place .onnx files in: {MODEL_DIR}")
+    global _default_voice_name
+    _default_voice_name = DEFAULT_MODEL
+    voice = load_voice(DEFAULT_MODEL)
+    if not voice:
+        print(f"[error] Failed to load default model. Place .onnx files in: {MODEL_DIR}")
         return
 
     server = HTTPServer(("0.0.0.0", PORT), Handler)
