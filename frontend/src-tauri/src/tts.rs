@@ -23,13 +23,42 @@ impl TtsState {
 
 impl Drop for TtsState {
     fn drop(&mut self) {
-        for mutex in [&self.piper_server, &self.process, &self.prefetch] {
-            if let Ok(mut guard) = mutex.lock() {
-                if let Some(ref mut child) = *guard {
-                    let _ = child.kill();
+        // Kill playback process group (bash + afplay + curl children)
+        if let Ok(mut guard) = self.process.lock() {
+            if let Some(ref mut child) = *guard {
+                #[cfg(unix)]
+                unsafe {
+                    // SIGKILL the entire process group so afplay/curl die too
+                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
                 }
+                let _ = child.kill();
             }
+            *guard = None;
         }
+        // Kill prefetch
+        if let Ok(mut guard) = self.prefetch.lock() {
+            if let Some(ref mut child) = *guard {
+                let _ = child.kill();
+            }
+            *guard = None;
+        }
+        // Kill Piper server
+        if let Ok(mut guard) = self.piper_server.lock() {
+            if let Some(ref mut child) = *guard {
+                let _ = child.kill();
+            }
+            *guard = None;
+        }
+        // Belt-and-suspenders: kill any orphaned afplay from our temp dir
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null; lsof -ti:8095 | xargs kill -9 2>/dev/null")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // Cleanup temp files
+        let _ = std::fs::remove_dir_all(PREFETCH_DIR);
+        let _ = std::fs::remove_file(PLAYBACK_SCRIPT);
     }
 }
 

@@ -23,18 +23,33 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
   const [prefetched, setPrefetched] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Load voices on mount
+  // Load voices on mount, retry if server isn't ready yet
   useEffect(() => {
-    void (async () => {
+    let cancelled = false;
+    const loadVoices = async () => {
       try {
         const [voiceList, saved] = await Promise.all([
           listVoices(),
           getSetting('ttsVoice'),
         ]);
-        setVoices(voiceList);
-        if (saved) setSelectedVoice(saved);
+        if (!cancelled && voiceList.length > 0) {
+          setVoices(voiceList);
+          if (saved) setSelectedVoice(saved);
+          return true;
+        }
       } catch { /* unavailable */ }
+      return false;
+    };
+    // Try immediately, then retry every 3s for up to 30s (server may be starting)
+    void (async () => {
+      if (await loadVoices()) return;
+      for (let i = 0; i < 10 && !cancelled; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        if (cancelled) return;
+        if (await loadVoices()) return;
+      }
     })();
+    return () => { cancelled = true; };
   }, []);
 
   // Prefetch audio when chapter changes

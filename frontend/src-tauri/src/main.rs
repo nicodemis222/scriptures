@@ -74,6 +74,42 @@ fn main() {
             ai::ai_explain,
             ai::translate_chapter,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Kill TTS processes on app exit
+                if let Some(tts) = app.try_state::<tts::TtsState>() {
+                    if let Ok(mut proc) = tts.process.lock() {
+                        if let Some(ref mut child) = *proc {
+                            #[cfg(unix)]
+                            unsafe {
+                                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                            }
+                            let _ = child.kill();
+                        }
+                        *proc = None;
+                    }
+                    if let Ok(mut pf) = tts.prefetch.lock() {
+                        if let Some(ref mut child) = *pf {
+                            let _ = child.kill();
+                        }
+                        *pf = None;
+                    }
+                    if let Ok(mut srv) = tts.piper_server.lock() {
+                        if let Some(ref mut child) = *srv {
+                            let _ = child.kill();
+                        }
+                        *srv = None;
+                    }
+                }
+                // Kill any orphaned afplay and Piper server
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null; lsof -ti:8095 | xargs kill -9 2>/dev/null")
+                    .status();
+                let _ = std::fs::remove_dir_all("/tmp/scriptures_tts_chunks");
+                let _ = std::fs::remove_file("/tmp/scriptures_tts_play.sh");
+            }
+        });
 }
