@@ -4,7 +4,6 @@ use std::collections::HashSet;
 use tauri::State;
 
 /// Helper to call Ollama API via curl with proper timeouts.
-/// Returns the parsed JSON response or an error string.
 fn call_ollama(endpoint: &str, body: &Value) -> Result<Value, String> {
     let url = format!("http://localhost:11434{}", endpoint);
     let output = std::process::Command::new("curl")
@@ -63,7 +62,7 @@ pub fn check_ollama_status() -> Result<Value, String> {
     }
 }
 
-/// Retrieve context verses from a specific chapter (owned results).
+/// Retrieve verses from the current chapter (highest priority context).
 fn retrieve_chapter_context(
     db: &State<DbState>,
     book: &str,
@@ -93,8 +92,8 @@ fn retrieve_chapter_context(
     Ok(verses)
 }
 
-/// Search for relevant verses via FTS5 (owned results, lock released after).
-fn fts_search_context(db: &State<DbState>, query: &str) -> Result<Vec<String>, String> {
+/// FTS5 search scoped to a specific book (same book, other chapters).
+fn fts_search_book(db: &State<DbState>, query: &str, book: &str, limit: usize) -> Result<Vec<String>, String> {
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
     let fts_query = crate::commands::sanitize_fts_query(query);
     let mut stmt = conn
@@ -103,13 +102,14 @@ fn fts_search_context(db: &State<DbState>, query: &str) -> Result<Vec<String>, S
              FROM scriptures_fts fts
              JOIN verses v ON fts.rowid = v.id
              WHERE scriptures_fts MATCH ?1
+               AND fts.book_title = ?2
              ORDER BY rank
-             LIMIT 10",
+             LIMIT ?3",
         )
         .map_err(|e| e.to_string())?;
 
     let verses: Vec<String> = stmt
-        .query_map([&fts_query], |row| {
+        .query_map(rusqlite::params![&fts_query, book, limit as i64], |row| {
             let text: String = row.get(0)?;
             let reference: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
             Ok(format!("{}: {}", reference, text))
@@ -121,8 +121,120 @@ fn fts_search_context(db: &State<DbState>, query: &str) -> Result<Vec<String>, S
     Ok(verses)
 }
 
-/// RAG-augmented query using FTS5 for retrieval and Ollama for generation.
-/// DB lock is released BEFORE calling Ollama to avoid blocking other commands.
+/// FTS5 search scoped to a specific volume (same volume, other books).
+fn fts_search_volume(db: &State<DbState>, query: &str, book: &str, limit: usize) -> Result<Vec<String>, String> {
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let fts_query = crate::commands::sanitize_fts_query(query);
+
+    // First find the volume for this book
+    let volume_title: String = conn
+        .query_row(
+            "SELECT vol.title FROM books b
+             JOIN volumes vol ON b.volume_id = vol.id
+             WHERE b.title = ?1 LIMIT 1",
+            [book],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+
+    if volume_title.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT v.text, v.reference
+             FROM scriptures_fts fts
+             JOIN verses v ON fts.rowid = v.id
+             WHERE scriptures_fts MATCH ?1
+               AND fts.volume_title = ?2
+               AND fts.book_title != ?3
+             ORDER BY rank
+             LIMIT ?4",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let verses: Vec<String> = stmt
+        .query_map(rusqlite::params![&fts_query, &volume_title, book, limit as i64], |row| {
+            let text: String = row.get(0)?;
+            let reference: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+            Ok(format!("{}: {}", reference, text))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+
+    Ok(verses)
+}
+
+/// FTS5 search across ALL volumes (global cross-canon search).
+fn fts_search_global(db: &State<DbState>, query: &str, exclude_volume: &str, limit: usize) -> Result<Vec<String>, String> {
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let fts_query = crate::commands::sanitize_fts_query(query);
+
+    let mut stmt = if exclude_volume.is_empty() {
+        conn.prepare(
+            "SELECT v.text, v.reference
+             FROM scriptures_fts fts
+             JOIN verses v ON fts.rowid = v.id
+             WHERE scriptures_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        conn.prepare(
+            "SELECT v.text, v.reference
+             FROM scriptures_fts fts
+             JOIN verses v ON fts.rowid = v.id
+             WHERE scriptures_fts MATCH ?1
+               AND fts.volume_title != ?2
+             ORDER BY rank
+             LIMIT ?3",
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    let verses: Vec<String> = if exclude_volume.is_empty() {
+        stmt.query_map(rusqlite::params![&fts_query, limit as i64], |row| {
+            let text: String = row.get(0)?;
+            let reference: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+            Ok(format!("{}: {}", reference, text))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+    } else {
+        stmt.query_map(rusqlite::params![&fts_query, exclude_volume, limit as i64], |row| {
+            let text: String = row.get(0)?;
+            let reference: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+            Ok(format!("{}: {}", reference, text))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?
+    };
+
+    Ok(verses)
+}
+
+/// Look up the volume title for a given book.
+fn get_volume_for_book(db: &State<DbState>, book: &str) -> String {
+    let conn = match db.conn.lock() {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+    conn.query_row(
+        "SELECT vol.title FROM books b JOIN volumes vol ON b.volume_id = vol.id WHERE b.title = ?1 LIMIT 1",
+        [book],
+        |row| row.get(0),
+    )
+    .unwrap_or_default()
+}
+
+/// RAG-augmented query with tiered cross-canon retrieval.
+/// Priority: current chapter > same book > same volume > all other volumes.
+/// DB lock is released BEFORE calling Ollama.
 #[tauri::command]
 pub fn ai_query(
     db: State<DbState>,
@@ -131,42 +243,69 @@ pub fn ai_query(
     context_chapter: Option<i64>,
     model: Option<String>,
 ) -> Result<Value, String> {
-    // Step 1: Retrieve context (DB lock acquired and released per call)
     let mut context_verses = Vec::new();
     let mut seen = HashSet::new();
-
-    if let (Some(ref book), Some(chapter)) = (&context_book, context_chapter) {
-        for entry in retrieve_chapter_context(&db, book, chapter)? {
-            seen.insert(entry.clone());
-            context_verses.push(entry);
-        }
-    }
 
     let search_terms: String = prompt
         .split_whitespace()
         .take(10)
         .collect::<Vec<_>>()
         .join(" ");
-    for entry in fts_search_context(&db, &search_terms)? {
+
+    let volume_title = context_book
+        .as_ref()
+        .map(|b| get_volume_for_book(&db, b))
+        .unwrap_or_default();
+
+    // Tier 1: Current chapter verses (up to 20)
+    if let (Some(ref book), Some(chapter)) = (&context_book, context_chapter) {
+        for entry in retrieve_chapter_context(&db, book, chapter).unwrap_or_default() {
+            seen.insert(entry.clone());
+            context_verses.push(entry);
+        }
+    }
+
+    // Tier 2: Same book, other chapters via FTS (up to 8)
+    if let Some(ref book) = context_book {
+        for entry in fts_search_book(&db, &search_terms, book, 8).unwrap_or_default() {
+            if seen.insert(entry.clone()) {
+                context_verses.push(entry);
+            }
+        }
+    }
+
+    // Tier 3: Same volume, other books via FTS (up to 6)
+    if let Some(ref book) = context_book {
+        for entry in fts_search_volume(&db, &search_terms, book, 6).unwrap_or_default() {
+            if seen.insert(entry.clone()) {
+                context_verses.push(entry);
+            }
+        }
+    }
+
+    // Tier 4: All other volumes via FTS (up to 6)
+    for entry in fts_search_global(&db, &search_terms, &volume_title, 6).unwrap_or_default() {
         if seen.insert(entry.clone()) {
             context_verses.push(entry);
         }
     }
 
-    // Step 2: Build augmented prompt (no DB lock held)
+    // Build augmented prompt (no DB lock held)
     let scripture_context = context_verses.join("\n");
     let augmented_prompt = format!(
-        "You are a knowledgeable scripture study assistant. Answer questions about the scriptures \
-         with reverence and accuracy. Always cite specific verses when possible.\n\n\
+        "You are a knowledgeable scripture study assistant with access to the Book of Mormon, \
+         Holy Bible (KJV), Doctrine & Covenants, Pearl of Great Price, Coptic Bible, \
+         Dead Sea Scrolls, Russian Orthodox texts, Ancient Witnesses, and Hymns.\n\n\
+         Answer questions with reverence and accuracy. Cite specific verses when possible. \
+         Draw connections across different scripture volumes when relevant.\n\n\
          ## Relevant Scripture Passages:\n{}\n\n\
          ## Question:\n{}\n\n\
          ## Answer:",
         scripture_context, prompt
     );
 
-    // Step 3: Call Ollama (no DB lock held)
+    // Call Ollama (no DB lock held)
     let model_name = model.unwrap_or_else(|| "llama3.2:latest".to_string());
-    // Validate model name
     if model_name.len() > 64
         || !model_name
             .chars()
@@ -194,11 +333,11 @@ pub fn ai_query(
 }
 
 /// Explain a specific verse using the local LLM.
+/// Includes surrounding verses + cross-reference search for richer context.
 /// DB lock is released BEFORE calling Ollama.
 #[tauri::command]
 pub fn ai_explain(db: State<DbState>, verse_id: i64) -> Result<Value, String> {
-    // Fetch verse data + surrounding context (lock acquired and released here)
-    let (text, reference, book_title, surrounding) = {
+    let (text, reference, book_title, surrounding, cross_refs) = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
         let main = conn.query_row(
             "SELECT v.text, v.reference, b.title, v.chapter_id, v.verse_number
@@ -219,7 +358,7 @@ pub fn ai_explain(db: State<DbState>, verse_id: i64) -> Result<Value, String> {
         )
         .map_err(|e| e.to_string())?;
 
-        // Fetch 2 verses before and after for context
+        // Fetch 2 verses before and after
         let mut stmt = conn
             .prepare(
                 "SELECT v.verse_number, v.text FROM verses v
@@ -244,20 +383,61 @@ pub fn ai_explain(db: State<DbState>, verse_id: i64) -> Result<Value, String> {
             .filter_map(|r| r.ok())
             .collect();
 
-        (main.0, main.1, main.2, context_verses.join("\n"))
-    }; // conn dropped here — lock released
+        // Cross-reference: search for key terms across all volumes
+        let key_words: String = main.0
+            .split_whitespace()
+            .filter(|w| w.len() > 4)
+            .take(5)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let fts_query = crate::commands::sanitize_fts_query(&key_words);
+        let cross: Vec<String> = if !key_words.is_empty() {
+            let mut fts_stmt = conn
+                .prepare(
+                    "SELECT v.text, v.reference
+                     FROM scriptures_fts fts
+                     JOIN verses v ON fts.rowid = v.id
+                     WHERE scriptures_fts MATCH ?1
+                       AND v.id != ?2
+                     ORDER BY rank
+                     LIMIT 5",
+                )
+                .map_err(|e| e.to_string())?;
+            let results: Vec<String> = fts_stmt
+                .query_map(rusqlite::params![&fts_query, verse_id], |row| {
+                    let t: String = row.get(0)?;
+                    let r: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+                    Ok(format!("{}: {}", r, t))
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            results
+        } else {
+            Vec::new()
+        };
+
+        (main.0, main.1, main.2, context_verses.join("\n"), cross.join("\n"))
+    }; // conn dropped — lock released
 
     let context_section = if surrounding.is_empty() {
         String::new()
     } else {
-        format!("\n\nSurrounding verses for context:\n{}", surrounding)
+        format!("\n\nSurrounding verses:\n{}", surrounding)
+    };
+
+    let cross_ref_section = if cross_refs.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nRelated passages from other scriptures:\n{}", cross_refs)
     };
 
     let prompt = format!(
         "Provide a brief, reverent explanation of this scripture verse. \
-         Include historical context and how it applies to daily life.\n\n\
-         {}: \"{}\"{}\n\nExplanation:",
-        reference, text, context_section
+         Include historical context, how it applies to daily life, and \
+         connections to related passages in other scripture volumes.\n\n\
+         {}: \"{}\"{}{}\n\nExplanation:",
+        reference, text, context_section, cross_ref_section
     );
 
     let request_body = json!({
@@ -278,8 +458,6 @@ pub fn ai_explain(db: State<DbState>, verse_id: i64) -> Result<Value, String> {
 }
 
 /// Translate a chapter of verses to a target language.
-/// Uses translation_cache table to avoid re-translating.
-/// Falls back to Ollama LLM for translation.
 #[tauri::command]
 pub fn translate_chapter(
     db: State<DbState>,
@@ -290,18 +468,9 @@ pub fn translate_chapter(
     if target_language == "English" {
         return Err("Already in English".to_string());
     }
-    // Validate target language against allowlist
     const VALID_LANGUAGES: &[&str] = &[
-        "Spanish",
-        "French",
-        "Portuguese",
-        "German",
-        "Italian",
-        "Chinese",
-        "Korean",
-        "Japanese",
-        "Russian",
-        "Arabic",
+        "Spanish", "French", "Portuguese", "German", "Italian",
+        "Chinese", "Korean", "Japanese", "Russian", "Arabic",
     ];
     if !VALID_LANGUAGES.contains(&target_language.as_str()) {
         return Err(format!("Unsupported language: {}", target_language));
@@ -309,7 +478,6 @@ pub fn translate_chapter(
 
     let conn = db.conn.lock().map_err(|e| e.to_string())?;
 
-    // Get all verses for this chapter
     let mut stmt = conn
         .prepare(
             "SELECT v.id, v.verse_number, v.text
@@ -323,11 +491,7 @@ pub fn translate_chapter(
 
     let verses: Vec<(i64, i64, String)> = stmt
         .query_map(rusqlite::params![&book, chapter], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
@@ -337,7 +501,7 @@ pub fn translate_chapter(
         return Err("No verses found for this chapter".to_string());
     }
 
-    // Check cache — single query for all verses (avoid N+1)
+    // Check cache
     let mut cached: std::collections::HashMap<i64, String> = std::collections::HashMap::new();
     let verse_ids: Vec<i64> = verses.iter().map(|(id, _, _)| *id).collect();
     if !verse_ids.is_empty() {
@@ -364,7 +528,6 @@ pub fn translate_chapter(
         }
     }
 
-    // If all cached, return immediately
     if cached.len() == verses.len() {
         let results: Vec<Value> = verses
             .iter()
@@ -379,13 +542,11 @@ pub fn translate_chapter(
         return Ok(json!({"translations": results, "from_cache": true}));
     }
 
-    // Collect uncached verses for batch translation
     let uncached: Vec<&(i64, i64, String)> = verses
         .iter()
         .filter(|(id, _, _)| !cached.contains_key(id))
         .collect();
 
-    // Build batch translation prompt — translate up to 20 verses at a time
     let batch_size = 20.min(uncached.len());
     let batch = &uncached[..batch_size];
     let verses_text: String = batch
@@ -409,10 +570,7 @@ pub fn translate_chapter(
         "model": "llama3.2:latest",
         "prompt": prompt,
         "stream": false,
-        "options": {
-            "temperature": 0.1,
-            "num_predict": 4096
-        }
+        "options": { "temperature": 0.1, "num_predict": 4096 }
     });
 
     let response = call_ollama("/api/generate", &request_body)?;
@@ -421,7 +579,6 @@ pub fn translate_chapter(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // Parse translated lines back to verse numbers
     let mut translated_map: std::collections::HashMap<i64, String> =
         std::collections::HashMap::new();
     for line in translated_text.lines() {
@@ -429,12 +586,10 @@ pub fn translate_chapter(
         if line.is_empty() {
             continue;
         }
-        // Try to match [N] prefix
         if let Some(rest) = line.strip_prefix('[') {
             if let Some(bracket_end) = rest.find(']') {
                 if let Ok(vn) = rest[..bracket_end].trim().parse::<i64>() {
                     let text = rest[bracket_end + 1..].trim().to_string();
-                    // Find the verse_id for this verse_number
                     if let Some((id, _, _)) = batch.iter().find(|(_, n, _)| *n == vn) {
                         translated_map.insert(*id, text);
                     }
@@ -443,7 +598,6 @@ pub fn translate_chapter(
         }
     }
 
-    // Cache the translations (log errors but don't fail the request)
     {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
         for (vid, text) in &translated_map {
@@ -456,7 +610,6 @@ pub fn translate_chapter(
         }
     }
 
-    // Merge cached + newly translated
     let mut all_translations = cached;
     all_translations.extend(translated_map);
 
