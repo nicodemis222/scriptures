@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { checkOllamaStatus, aiQuery, getSetting, setSetting, checkOllamaInstalled, installOllama, startOllama, pullOllamaModel } from '../hooks/useScriptures';
 import type { OllamaStatus } from '../types/scriptures';
 import { BrainIcon, XIcon } from './Icons';
