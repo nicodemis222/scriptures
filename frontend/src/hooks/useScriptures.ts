@@ -143,18 +143,6 @@ export async function listVoices(): Promise<VoiceInfo[]> {
   return invoke('list_voices');
 }
 
-// Piper TTS management
-export async function isPiperInstalled(): Promise<{ installed: boolean; running: boolean; path: string }> {
-  return invoke('is_vibevoice_installed');
-}
-
-export async function installPiper(): Promise<{ status: string }> {
-  return invoke('install_vibevoice');
-}
-
-export async function startPiper(): Promise<{ status: string }> {
-  return invoke('start_vibevoice');
-}
 
 export async function prefetchAudio(text: string, voice?: string): Promise<void> {
   const params: Record<string, unknown> = { text };

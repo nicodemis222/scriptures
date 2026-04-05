@@ -62,6 +62,110 @@ pub fn check_ollama_status() -> Result<Value, String> {
     }
 }
 
+// ── Ollama Management ──
+
+#[tauri::command]
+pub fn check_ollama_installed() -> Result<Value, String> {
+    let installed = std::process::Command::new("which")
+        .arg("ollama")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let running = std::process::Command::new("curl")
+        .args(["-s", "--connect-timeout", "1", "http://localhost:11434/api/tags"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    Ok(json!({"installed": installed, "running": running}))
+}
+
+#[tauri::command]
+pub fn install_ollama() -> Result<Value, String> {
+    if std::process::Command::new("which")
+        .arg("ollama")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(json!({"status": "already_installed"}));
+    }
+    if cfg!(target_os = "macos") {
+        match std::process::Command::new("brew")
+            .args(["install", "ollama"])
+            .output()
+        {
+            Ok(o) if o.status.success() => Ok(json!({"status": "installed", "method": "brew"})),
+            _ => {
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("curl -fsSL https://ollama.com/install.sh | sh")
+                    .output()
+                    .map_err(|e| format!("Install failed: {}", e))?;
+                if output.status.success() {
+                    Ok(json!({"status": "installed", "method": "curl"}))
+                } else {
+                    Err(format!(
+                        "Install failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ))
+                }
+            }
+        }
+    } else {
+        Err("Visit ollama.ai to download.".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn start_ollama() -> Result<Value, String> {
+    if std::process::Command::new("curl")
+        .args(["-s", "--connect-timeout", "1", "http://localhost:11434/api/tags"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(json!({"status": "already_running"}));
+    }
+    let _child = std::process::Command::new("ollama")
+        .arg("serve")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed: {}", e))?;
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let running = std::process::Command::new("curl")
+        .args(["-s", "--connect-timeout", "2", "http://localhost:11434/api/tags"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    Ok(json!({"status": if running { "started" } else { "starting" }}))
+}
+
+#[tauri::command]
+pub fn pull_ollama_model(model: String) -> Result<Value, String> {
+    if model.len() > 64
+        || !model
+            .chars()
+            .all(|c| c.is_alphanumeric() || ":.-_".contains(c))
+    {
+        return Err("Invalid model name".to_string());
+    }
+    let output = std::process::Command::new("ollama")
+        .args(["pull", &model])
+        .output()
+        .map_err(|e| format!("Failed: {}", e))?;
+    if output.status.success() {
+        Ok(json!({"status": "pulled", "model": model}))
+    } else {
+        Err(format!(
+            "Pull failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+// ── RAG Retrieval ──
+
 /// Retrieve verses from the current chapter (highest priority context).
 fn retrieve_chapter_context(
     db: &State<DbState>,
