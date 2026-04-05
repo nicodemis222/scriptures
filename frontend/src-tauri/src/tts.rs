@@ -69,6 +69,36 @@ impl Drop for TtsState {
 const PREFETCH_DIR: &str = "/tmp/scriptures_tts_chunks";
 const TTS_PORT: u16 = 8095;
 
+/// Start the Piper TTS server on app launch (called from setup, runs on background thread).
+pub fn start_piper_on_launch(tts: tauri::State<TtsState>) {
+    if piper_server_available() {
+        return;
+    }
+    let (python, server_py, model_dir) = piper_server_paths();
+    if server_py.is_empty() || !std::path::Path::new(&python).exists() {
+        return;
+    }
+    // Kill stale process on port
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!("lsof -ti:{} | xargs kill -9 2>/dev/null", TTS_PORT))
+        .output();
+
+    let child = Command::new(&python)
+        .arg(&server_py)
+        .env("TTS_PORT", TTS_PORT.to_string())
+        .env("MODEL_DIR", &model_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if let Ok(child) = child {
+        if let Ok(mut server) = tts.piper_server.lock() {
+            *server = Some(child);
+        }
+    }
+}
+
 /// Validate voice ID: alphanumeric, hyphens, underscores only
 fn is_valid_voice_id(voice: &str) -> bool {
     !voice.is_empty()

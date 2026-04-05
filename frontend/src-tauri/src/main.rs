@@ -15,6 +15,9 @@ fn main() {
             let db_state = db::init_db(app.handle())?;
             app.manage(db_state);
             app.manage(tts::TtsState::new());
+            // Start Piper TTS server in background so voices are ready
+            let tts_state = app.state::<tts::TtsState>();
+            tts::start_piper_on_launch(tts_state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
