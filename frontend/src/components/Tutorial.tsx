@@ -120,7 +120,7 @@ const SLIDES: TutorialSlide[] = [
     features: [
       { icon: <SpeakerIcon size={20} />, label: 'Read Aloud — system TTS, verse by verse' },
       { icon: <GlobeIcon size={20} />, label: 'Language — translate to 10+ languages' },
-      { icon: <BrainIcon size={20} />, label: 'AI Assistant — powered by local Ollama LLM' },
+      { icon: <BrainIcon size={20} />, label: 'AI Assistant — powered by local Qwen LLM' },
       { icon: <MoonIcon size={20} />, label: 'Dark Mode — easy on the eyes' },
     ],
   },

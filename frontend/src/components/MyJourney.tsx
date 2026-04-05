@@ -124,7 +124,11 @@ ${sampleHighlights ? `\nSample highlights:\n${sampleHighlights}` : ''}
 
 Be encouraging, specific, and reverent.`;
 
-      const result = await aiQuery(prompt);
+      // Pass most-studied book as context so RAG prioritizes it
+      const topBookName = [...bookMap.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([book]) => book)[0];
+      const result = await aiQuery(prompt, topBookName);
 
       const data: JourneyData = {
         response: result.response,
@@ -141,7 +145,7 @@ Be encouraging, specific, and reverent.`;
     } catch (err) {
       console.error('Journey generation failed:', err);
       setJourney({
-        response: 'Unable to generate your study journey. Please make sure Ollama is running and try again.',
+        response: 'Unable to generate your study journey. Please make sure the AI service is running and try again.',
         highlightCount: 0,
         noteCount: 0,
         bookCount: 0,

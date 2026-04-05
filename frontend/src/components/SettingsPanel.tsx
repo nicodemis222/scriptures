@@ -127,7 +127,7 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
           </div>
 
           <p className="settings-note">
-            Translation uses Ollama AI. Select a language here as default, or use the language dropdown in the verse reader to translate on the fly. Requires Ollama running locally.
+            Translation uses Qwen AI. Select a language here as default, or use the language dropdown in the verse reader to translate on the fly. Requires Ollama running locally with Qwen model.
           </p>
         </section>
 
@@ -152,7 +152,7 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
           <h3>AI Assistant</h3>
 
           <p className="settings-note">
-            Requires Ollama running locally. Install from ollama.ai
+            Requires Ollama running locally with Qwen model. Install from ollama.ai
           </p>
 
           <div className="settings-row">
