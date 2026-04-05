@@ -8,7 +8,57 @@ mod tts;
 
 use tauri::Manager;
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUNDLE_ID: &str = "com.scriptures.app";
+
+/// Clear stale caches when app version changes (ensures clean upgrade).
+fn clear_caches_on_upgrade() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let version_file = format!("{}/.scriptures/last_version", home);
+
+    // Read last version
+    let last_version = std::fs::read_to_string(&version_file).unwrap_or_default();
+    let last_version = last_version.trim();
+
+    if last_version == APP_VERSION {
+        return; // Same version, no cleanup needed
+    }
+
+    // Version changed (or first install) — clear caches
+    eprintln!(
+        "[upgrade] Version changed: {} → {}. Clearing caches.",
+        if last_version.is_empty() { "fresh" } else { last_version },
+        APP_VERSION
+    );
+
+    // Clear Tauri WebKit/webview caches
+    for dir in [
+        format!("{}/Library/WebKit/{}", home, BUNDLE_ID),
+        format!("{}/Library/Caches/{}", home, BUNDLE_ID),
+        format!("{}/Library/WebKit/com.scriptures.app", home),
+        format!("{}/Library/Caches/com.scriptures.app", home),
+    ] {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Clear TTS temp files from previous sessions
+    let _ = std::fs::remove_dir_all("/tmp/scriptures_tts_chunks");
+
+    // Kill any stale processes from old version
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null; lsof -ti:8095 | xargs kill -9 2>/dev/null")
+        .output();
+
+    // Write current version
+    let dir = format!("{}/.scriptures", home);
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&version_file, APP_VERSION);
+}
+
 fn main() {
+    clear_caches_on_upgrade();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {

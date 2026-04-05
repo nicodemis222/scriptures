@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicedoc/tauri-schema/refs/heads/main/src/schema.json",
   "productName": "Scriptures",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.scriptures.app",
   "build": {
     "frontendDist": "../dist",
