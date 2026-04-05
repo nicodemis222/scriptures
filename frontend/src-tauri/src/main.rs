@@ -78,14 +78,13 @@ fn main() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                // Kill TTS processes on app exit
                 if let Some(tts) = app.try_state::<tts::TtsState>() {
+                    // Signal cancellation to playback thread
+                    tts.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    tts.paused.store(false, std::sync::atomic::Ordering::Relaxed);
+                    // Kill current afplay
                     if let Ok(mut proc) = tts.process.lock() {
                         if let Some(ref mut child) = *proc {
-                            #[cfg(unix)]
-                            unsafe {
-                                libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
-                            }
                             let _ = child.kill();
                         }
                         *proc = None;
@@ -109,7 +108,6 @@ fn main() {
                     .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null; lsof -ti:8095 | xargs kill -9 2>/dev/null")
                     .status();
                 let _ = std::fs::remove_dir_all("/tmp/scriptures_tts_chunks");
-                let _ = std::fs::remove_file("/tmp/scriptures_tts_play.sh");
             }
         });
 }

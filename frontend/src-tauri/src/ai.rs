@@ -197,11 +197,11 @@ pub fn ai_query(
 /// DB lock is released BEFORE calling Ollama.
 #[tauri::command]
 pub fn ai_explain(db: State<DbState>, verse_id: i64) -> Result<Value, String> {
-    // Fetch verse data (lock acquired and released here)
-    let (text, reference, book_title) = {
+    // Fetch verse data + surrounding context (lock acquired and released here)
+    let (text, reference, book_title, surrounding) = {
         let conn = db.conn.lock().map_err(|e| e.to_string())?;
-        conn.query_row(
-            "SELECT v.text, v.reference, b.title
+        let main = conn.query_row(
+            "SELECT v.text, v.reference, b.title, v.chapter_id, v.verse_number
              FROM verses v
              JOIN chapters c ON v.chapter_id = c.id
              JOIN books b ON c.book_id = b.id
@@ -212,17 +212,52 @@ pub fn ai_explain(db: State<DbState>, verse_id: i64) -> Result<Value, String> {
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?.unwrap_or_default(),
                     row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+        // Fetch 2 verses before and after for context
+        let mut stmt = conn
+            .prepare(
+                "SELECT v.verse_number, v.text FROM verses v
+                 WHERE v.chapter_id = ?1
+                   AND v.verse_number BETWEEN ?2 AND ?3
+                   AND v.id != ?4
+                 ORDER BY v.verse_number",
+            )
+            .map_err(|e| e.to_string())?;
+        let context_verses: Vec<String> = stmt
+            .query_map(
+                rusqlite::params![main.3, main.4 - 2, main.4 + 2, verse_id],
+                |row| {
+                    Ok(format!(
+                        "v{}: {}",
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?
+                    ))
+                },
+            )
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        (main.0, main.1, main.2, context_verses.join("\n"))
     }; // conn dropped here — lock released
+
+    let context_section = if surrounding.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nSurrounding verses for context:\n{}", surrounding)
+    };
 
     let prompt = format!(
         "Provide a brief, reverent explanation of this scripture verse. \
          Include historical context and how it applies to daily life.\n\n\
-         {}: \"{}\"\n\nExplanation:",
-        reference, text
+         {}: \"{}\"{}\n\nExplanation:",
+        reference, text, context_section
     );
 
     let request_body = json!({

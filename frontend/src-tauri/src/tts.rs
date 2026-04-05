@@ -1,11 +1,14 @@
 use serde_json::{json, Value};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::State;
 
 pub struct TtsState {
-    pub process: Mutex<Option<Child>>,
-    pub paused: Mutex<bool>,
+    pub process: Arc<Mutex<Option<Child>>>,
+    pub paused: Arc<AtomicBool>,
+    pub cancelled: Arc<AtomicBool>,
+    pub playing: Arc<AtomicBool>,
     pub prefetch: Mutex<Option<Child>>,
     pub piper_server: Mutex<Option<Child>>,
 }
@@ -13,8 +16,10 @@ pub struct TtsState {
 impl TtsState {
     pub fn new() -> Self {
         TtsState {
-            process: Mutex::new(None),
-            paused: Mutex::new(false),
+            process: Arc::new(Mutex::new(None)),
+            paused: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            playing: Arc::new(AtomicBool::new(false)),
             prefetch: Mutex::new(None),
             piper_server: Mutex::new(None),
         }
@@ -23,48 +28,55 @@ impl TtsState {
 
 impl Drop for TtsState {
     fn drop(&mut self) {
-        // Kill playback process group (bash + afplay + curl children)
+        // Kill playback process (afplay)
         if let Ok(mut guard) = self.process.lock() {
             if let Some(ref mut child) = *guard {
                 #[cfg(unix)]
-                unsafe {
-                    // SIGKILL the entire process group so afplay/curl die too
-                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                {
+                    let pid = child.id();
+                    if pid <= i32::MAX as u32 {
+                        // SAFETY: kill process group so afplay children die too
+                        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
+                    }
                 }
                 let _ = child.kill();
             }
             *guard = None;
         }
-        // Kill prefetch
         if let Ok(mut guard) = self.prefetch.lock() {
             if let Some(ref mut child) = *guard {
                 let _ = child.kill();
             }
             *guard = None;
         }
-        // Kill Piper server
         if let Ok(mut guard) = self.piper_server.lock() {
             if let Some(ref mut child) = *guard {
                 let _ = child.kill();
             }
             *guard = None;
         }
-        // Belt-and-suspenders: kill any orphaned afplay from our temp dir
+        // Kill any orphaned afplay and Piper server
         let _ = Command::new("sh")
             .arg("-c")
             .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null; lsof -ti:8095 | xargs kill -9 2>/dev/null")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        // Cleanup temp files
         let _ = std::fs::remove_dir_all(PREFETCH_DIR);
-        let _ = std::fs::remove_file(PLAYBACK_SCRIPT);
     }
 }
 
-const PLAYBACK_SCRIPT: &str = "/tmp/scriptures_tts_play.sh";
 const PREFETCH_DIR: &str = "/tmp/scriptures_tts_chunks";
 const TTS_PORT: u16 = 8095;
+
+/// Validate voice ID: alphanumeric, hyphens, underscores only
+fn is_valid_voice_id(voice: &str) -> bool {
+    !voice.is_empty()
+        && voice.len() <= 64
+        && voice
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
 
 fn piper_server_available() -> bool {
     Command::new("curl")
@@ -80,34 +92,26 @@ fn piper_server_available() -> bool {
 }
 
 /// Find the Piper TTS server.py and models directory.
-/// Returns (python_path, server_py_path, model_dir)
 fn piper_server_paths() -> (String, String, String) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
 
-    // Check for venv in ~/.scriptures/piper-env/
     let venv_python = format!("{}/.scriptures/piper-env/bin/python", home);
-    let venv_exists = std::path::Path::new(&venv_python).exists();
-
-    let python = if venv_exists {
+    let python = if std::path::Path::new(&venv_python).exists() {
         venv_python
     } else {
         "python3".to_string()
     };
 
-    // Server script location: check bundled first, then project, then ~/.scriptures
-    let server_locations = vec![
-        // Inside .app bundle
+    let server_locations = [
         std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|p| p.join("../Resources/piper/server.py")))
             .unwrap_or_default(),
-        // Development: project services dir
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
             .map(|p| p.join("services/piper-tts/server.py"))
             .unwrap_or_default(),
-        // Fallback: home dir
         std::path::PathBuf::from(&home)
             .join(".scriptures")
             .join("piper")
@@ -120,7 +124,6 @@ fn piper_server_paths() -> (String, String, String) {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    // Model directory: next to server.py
     let model_dir = if !server_py.is_empty() {
         std::path::Path::new(&server_py)
             .parent()
@@ -155,32 +158,40 @@ fn split_into_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
-/// Generate a shell script that synthesizes sentences one at a time and plays each immediately.
-fn generate_playback_script(sentences: &[String], voice: &str, rate: f32) -> String {
-    let rate_mult = format!("{:.2}", rate / 175.0);
-    let mut script = String::from("#!/bin/bash\nset -e\n");
-    script.push_str(&format!("mkdir -p {}\n", PREFETCH_DIR));
+/// Synthesize a single sentence via Piper HTTP API. Returns path to WAV file.
+fn synthesize_sentence(sentence: &str, voice: &str, index: usize) -> Option<String> {
+    let wav_path = format!("{}/chunk_{:04}.wav", PREFETCH_DIR, index);
+    let body = json!({"text": sentence, "voice": voice});
 
-    for (i, sentence) in sentences.iter().enumerate() {
-        let escaped = sentence.replace('\'', "'\\''");
-        let wav_path = format!("{}/chunk_{:04}.wav", PREFETCH_DIR, i);
+    let output = Command::new("curl")
+        .args([
+            "-sN",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "30",
+            "-X",
+            "POST",
+            &format!("http://localhost:{}/synthesize", TTS_PORT),
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            &body.to_string(),
+            "-o",
+            &wav_path,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
 
-        script.push_str(&format!(
-            "curl -sN -X POST http://localhost:{}/synthesize \\\n  -H 'Content-Type: application/json' \\\n  -d '{{\"text\":\"{}\",\"voice\":\"{}\"}}' \\\n  -o '{}' 2>/dev/null\n",
-            TTS_PORT,
-            escaped.replace('\"', "\\\"").replace('\n', " "),
-            voice,
-            wav_path,
-        ));
-
-        script.push_str(&format!(
-            "[ -f '{}' ] && [ -s '{}' ] && afplay -r {} '{}' 2>/dev/null\n",
-            wav_path, wav_path, rate_mult, wav_path,
-        ));
+    if output.status.success() {
+        let size = std::fs::metadata(&wav_path).map(|m| m.len()).unwrap_or(0);
+        if size > 1024 {
+            return Some(wav_path);
+        }
     }
-
-    script.push_str(&format!("rm -rf {}\n", PREFETCH_DIR));
-    script
+    None
 }
 
 #[tauri::command]
@@ -248,7 +259,9 @@ pub fn prefetch_audio(
         return Ok(());
     }
 
-    let voice_id = voice.unwrap_or_else(|| "en_US-lessac-high".to_string());
+    let voice_id = voice
+        .filter(|v| is_valid_voice_id(v))
+        .unwrap_or_else(|| "en_US-lessac-high".to_string());
     let body = json!({"text": first, "voice": voice_id});
 
     let _ = std::fs::create_dir_all(PREFETCH_DIR);
@@ -288,14 +301,13 @@ pub fn is_prefetch_ready() -> Result<bool, String> {
     Ok(size > 1024)
 }
 
-/// Start Piper TTS server using venv Python + server.py
+/// Start Piper TTS server using venv Python + server.py (non-blocking on separate thread)
 fn auto_start_piper(tts: &State<TtsState>) -> bool {
     let (python, server_py, model_dir) = piper_server_paths();
     if server_py.is_empty() || !std::path::Path::new(&python).exists() {
         return false;
     }
 
-    // Kill any stale process on the port
     let _ = Command::new("sh")
         .arg("-c")
         .arg(format!("lsof -ti:{} | xargs kill -9 2>/dev/null", TTS_PORT))
@@ -314,7 +326,6 @@ fn auto_start_piper(tts: &State<TtsState>) -> bool {
         if let Ok(mut server) = tts.piper_server.lock() {
             *server = Some(child);
         }
-        // Wait for server to come up (model load takes a few seconds)
         for _ in 0..20 {
             std::thread::sleep(std::time::Duration::from_millis(500));
             if piper_server_available() {
@@ -325,6 +336,101 @@ fn auto_start_piper(tts: &State<TtsState>) -> bool {
     false
 }
 
+/// Play sentences using direct Command API calls (no shell script generation).
+/// Runs on a background thread. Uses AtomicBool flags for pause/cancel.
+fn play_sentences(
+    sentences: Vec<String>,
+    voice: String,
+    rate: f32,
+    cancelled: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    playing: Arc<AtomicBool>,
+    process: Arc<Mutex<Option<Child>>>,
+) {
+    let rate_mult = format!("{:.2}", rate / 175.0);
+    let _ = std::fs::create_dir_all(PREFETCH_DIR);
+
+    for (i, sentence) in sentences.iter().enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Wait while paused
+        while paused.load(Ordering::Relaxed) {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Synthesize
+        let wav_path = match synthesize_sentence(sentence, &voice, i) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Play with afplay (blocks until done)
+        let child = Command::new("afplay")
+            .args(["-r", &rate_mult, &wav_path])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        if let Ok(mut child) = child {
+            // Store the afplay process so pause/stop can signal it
+            if let Ok(mut proc) = process.lock() {
+                *proc = Some(child);
+            } else {
+                let _ = child.wait();
+                continue;
+            }
+
+            // Wait for afplay to finish, checking cancel flag
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    if let Ok(mut proc) = process.lock() {
+                        if let Some(ref mut c) = *proc {
+                            let _ = c.kill();
+                        }
+                        *proc = None;
+                    }
+                    break;
+                }
+
+                if let Ok(mut proc) = process.lock() {
+                    if let Some(ref mut c) = *proc {
+                        match c.try_wait() {
+                            Ok(Some(_)) => {
+                                *proc = None;
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
+                                *proc = None;
+                                break;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
+    playing.store(false, Ordering::Relaxed);
+    // Cleanup
+    let _ = std::fs::remove_dir_all(PREFETCH_DIR);
+}
+
 #[tauri::command]
 pub fn read_aloud(
     text: String,
@@ -333,6 +439,7 @@ pub fn read_aloud(
     tts: State<TtsState>,
 ) -> Result<(), String> {
     // Kill existing playback
+    tts.cancelled.store(true, Ordering::Relaxed);
     {
         let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
         if let Some(ref mut child) = *proc {
@@ -340,140 +447,117 @@ pub fn read_aloud(
         }
         *proc = None;
     }
-    {
-        let mut p = tts.paused.lock().map_err(|e| e.to_string())?;
-        *p = false;
-    }
+    // Brief pause for previous thread to notice cancel
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    tts.cancelled.store(false, Ordering::Relaxed);
+    tts.paused.store(false, Ordering::Relaxed);
 
     // Auto-start Piper server if not running
-    if !piper_server_available() {
-        if !auto_start_piper(&tts) {
-            return Err("Piper TTS server not available. Install it from Settings.".to_string());
-        }
+    if !piper_server_available() && !auto_start_piper(&tts) {
+        return Err("Piper TTS server not available. Install it from Settings.".to_string());
     }
 
     let rate_val = rate.unwrap_or(175.0).clamp(50.0, 500.0);
-    let voice_id = voice.unwrap_or_else(|| "en_US-lessac-high".to_string());
+    let voice_id = voice
+        .filter(|v| is_valid_voice_id(v))
+        .unwrap_or_else(|| "en_US-lessac-high".to_string());
 
     let sentences = split_into_sentences(&text);
     if sentences.is_empty() {
         return Ok(());
     }
 
-    let script = generate_playback_script(&sentences, &voice_id, rate_val);
-    std::fs::write(PLAYBACK_SCRIPT, &script)
-        .map_err(|e| format!("Failed to write playback script: {}", e))?;
+    tts.playing.store(true, Ordering::Relaxed);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(PLAYBACK_SCRIPT, std::fs::Permissions::from_mode(0o755));
-    }
+    let cancelled = tts.cancelled.clone();
+    let paused = tts.paused.clone();
+    let playing = tts.playing.clone();
+    let process = tts.process.clone();
 
-    let child = Command::new("bash")
-        .arg(PLAYBACK_SCRIPT)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to start playback: {}", e))?;
+    std::thread::spawn(move || {
+        play_sentences(sentences, voice_id, rate_val, cancelled, paused, playing, process);
+    });
 
-    let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
-    *proc = Some(child);
     Ok(())
 }
 
 #[tauri::command]
 pub fn pause_reading(tts: State<TtsState>) -> Result<(), String> {
-    let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
-    if let Some(ref mut child) = *proc {
-        match child.try_wait() {
-            Ok(None) => {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-(child.id() as libc::pid_t), libc::SIGSTOP);
-                }
-            }
-            _ => {
-                *proc = None;
-                return Ok(());
+    tts.paused.store(true, Ordering::Relaxed);
+    // Also SIGSTOP current afplay if running
+    let proc = tts.process.lock().map_err(|e| e.to_string())?;
+    if let Some(ref child) = *proc {
+        #[cfg(unix)]
+        {
+            let pid = child.id();
+            if pid <= i32::MAX as u32 {
+                // SAFETY: SIGSTOP the afplay process
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP); }
             }
         }
     }
-    let mut p = tts.paused.lock().map_err(|e| e.to_string())?;
-    *p = true;
     Ok(())
 }
 
 #[tauri::command]
 pub fn resume_reading(tts: State<TtsState>) -> Result<(), String> {
-    let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
-    if let Some(ref mut child) = *proc {
-        match child.try_wait() {
-            Ok(None) => {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(-(child.id() as libc::pid_t), libc::SIGCONT);
-                }
-            }
-            _ => {
-                *proc = None;
-                return Ok(());
+    tts.paused.store(false, Ordering::Relaxed);
+    let proc = tts.process.lock().map_err(|e| e.to_string())?;
+    if let Some(ref child) = *proc {
+        #[cfg(unix)]
+        {
+            let pid = child.id();
+            if pid <= i32::MAX as u32 {
+                // SAFETY: SIGCONT the afplay process
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT); }
             }
         }
     }
-    let mut p = tts.paused.lock().map_err(|e| e.to_string())?;
-    *p = false;
     Ok(())
 }
 
 #[tauri::command]
 pub fn stop_reading(tts: State<TtsState>) -> Result<(), String> {
+    tts.cancelled.store(true, Ordering::Relaxed);
+    tts.paused.store(false, Ordering::Relaxed);
+    tts.playing.store(false, Ordering::Relaxed);
+
     let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
     if let Some(ref mut child) = *proc {
         #[cfg(unix)]
-        unsafe {
-            libc::kill(-(child.id() as libc::pid_t), libc::SIGCONT);
-            libc::kill(-(child.id() as libc::pid_t), libc::SIGTERM);
+        {
+            let pid = child.id();
+            if pid <= i32::MAX as u32 {
+                // SAFETY: Resume then kill
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGCONT);
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
         }
         let _ = child.kill();
     }
     *proc = None;
-    let mut p = tts.paused.lock().map_err(|e| e.to_string())?;
-    *p = false;
+
     let _ = Command::new("sh")
         .arg("-c")
-        .arg("pkill -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null")
+        .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null")
         .output();
     let _ = std::fs::remove_dir_all(PREFETCH_DIR);
-    let _ = std::fs::remove_file(PLAYBACK_SCRIPT);
     Ok(())
 }
 
 #[tauri::command]
 pub fn is_reading(tts: State<TtsState>) -> Result<Value, String> {
-    let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
-    let paused = *tts.paused.lock().map_err(|e| e.to_string())?;
-
-    if let Some(ref mut child) = *proc {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                *proc = None;
-                Ok(json!({"playing": false, "paused": false}))
-            }
-            Ok(None) => Ok(json!({"playing": !paused, "paused": paused})),
-            Err(_) => {
-                *proc = None;
-                Ok(json!({"playing": false, "paused": false}))
-            }
-        }
-    } else {
-        Ok(json!({"playing": false, "paused": false}))
-    }
+    let playing = tts.playing.load(Ordering::Relaxed);
+    let paused = tts.paused.load(Ordering::Relaxed);
+    Ok(json!({"playing": playing && !paused, "paused": playing && paused}))
 }
 
 // ── Piper TTS Server Management ──
-// Note: Command names kept as is_vibevoice_installed/install_vibevoice/start_vibevoice
-// to maintain frontend API compatibility. They now manage Piper TTS.
+// Command names kept as is_vibevoice_installed/install_vibevoice/start_vibevoice
+// for frontend API compatibility. They now manage Piper TTS.
 
 #[tauri::command]
 pub fn is_vibevoice_installed() -> Result<Value, String> {
@@ -496,7 +580,6 @@ pub fn install_vibevoice() -> Result<Value, String> {
     let venv_path = format!("{}/.scriptures/piper-env", home);
     let venv_python = format!("{}/bin/python", venv_path);
 
-    // Check if already installed
     if std::path::Path::new(&venv_python).exists() {
         let check = Command::new(&venv_python)
             .args(["-c", "import piper"])
@@ -506,7 +589,6 @@ pub fn install_vibevoice() -> Result<Value, String> {
         }
     }
 
-    // Create venv
     let output = Command::new("python3")
         .args(["-m", "venv", &venv_path])
         .output()
@@ -515,7 +597,6 @@ pub fn install_vibevoice() -> Result<Value, String> {
         return Err("Failed to create Python venv".to_string());
     }
 
-    // Install piper-tts
     let pip = format!("{}/bin/pip", venv_path);
     let output = Command::new(&pip)
         .args(["install", "piper-tts"])
@@ -542,7 +623,6 @@ pub fn start_vibevoice(tts: State<TtsState>) -> Result<Value, String> {
         return Err("Piper TTS not installed. Click Install first.".to_string());
     }
 
-    // Kill anything on the port first
     let _ = Command::new("sh")
         .arg("-c")
         .arg(format!("lsof -ti:{} | xargs kill -9 2>/dev/null", TTS_PORT))
@@ -591,12 +671,7 @@ pub fn check_ollama_installed() -> Result<Value, String> {
         .map(|o| o.status.success())
         .unwrap_or(false);
     let running = Command::new("curl")
-        .args([
-            "-s",
-            "--connect-timeout",
-            "1",
-            "http://localhost:11434/api/tags",
-        ])
+        .args(["-s", "--connect-timeout", "1", "http://localhost:11434/api/tags"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -625,10 +700,7 @@ pub fn install_ollama() -> Result<Value, String> {
                 if output.status.success() {
                     Ok(json!({"status": "installed", "method": "curl"}))
                 } else {
-                    Err(format!(
-                        "Install failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    ))
+                    Err(format!("Install failed: {}", String::from_utf8_lossy(&output.stderr)))
                 }
             }
         }
@@ -640,12 +712,7 @@ pub fn install_ollama() -> Result<Value, String> {
 #[tauri::command]
 pub fn start_ollama() -> Result<Value, String> {
     if Command::new("curl")
-        .args([
-            "-s",
-            "--connect-timeout",
-            "1",
-            "http://localhost:11434/api/tags",
-        ])
+        .args(["-s", "--connect-timeout", "1", "http://localhost:11434/api/tags"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -660,12 +727,7 @@ pub fn start_ollama() -> Result<Value, String> {
         .map_err(|e| format!("Failed: {}", e))?;
     std::thread::sleep(std::time::Duration::from_secs(2));
     let running = Command::new("curl")
-        .args([
-            "-s",
-            "--connect-timeout",
-            "2",
-            "http://localhost:11434/api/tags",
-        ])
+        .args(["-s", "--connect-timeout", "2", "http://localhost:11434/api/tags"])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -675,9 +737,7 @@ pub fn start_ollama() -> Result<Value, String> {
 #[tauri::command]
 pub fn pull_ollama_model(model: String) -> Result<Value, String> {
     if model.len() > 64
-        || !model
-            .chars()
-            .all(|c| c.is_alphanumeric() || ":.-_".contains(c))
+        || !model.chars().all(|c| c.is_alphanumeric() || ":.-_".contains(c))
     {
         return Err("Invalid model name".to_string());
     }
@@ -688,9 +748,6 @@ pub fn pull_ollama_model(model: String) -> Result<Value, String> {
     if output.status.success() {
         Ok(json!({"status": "pulled", "model": model}))
     } else {
-        Err(format!(
-            "Pull failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
+        Err(format!("Pull failed: {}", String::from_utf8_lossy(&output.stderr)))
     }
 }

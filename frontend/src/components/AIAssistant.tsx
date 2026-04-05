@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { checkOllamaStatus, aiQuery, getSetting, setSetting, checkOllamaInstalled, installOllama, startOllama, pullOllamaModel } from '../hooks/useScriptures';
 import type { OllamaStatus } from '../types/scriptures';
 import { BrainIcon, XIcon } from './Icons';
@@ -42,7 +42,8 @@ function OllamaSetup({ onReady }: { onReady: () => void }) {
         setStatus('not_installed');
       }
     })();
-  }, [onReady]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleInstall = async () => {
     setProgress('Installing Ollama...');
