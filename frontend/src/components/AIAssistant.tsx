@@ -257,9 +257,24 @@ export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantPr
       ) : chatModels.length === 0 ? (
         <div className="ai-status">
           <p style={{ marginBottom: 12 }}>Ollama is running but no chat models found.</p>
-          <p style={{ fontSize: 13, opacity: 0.8 }}>
-            Run: <code>ollama pull qwen2.5</code>
-          </p>
+          <button
+            className="ai-action-btn"
+            onClick={async () => {
+              try {
+                const btn = document.querySelector('.ai-action-btn') as HTMLButtonElement;
+                if (btn) { btn.disabled = true; btn.textContent = 'Downloading qwen2.5... (this may take a minute)'; }
+                await pullOllamaModel('qwen2.5');
+                const s = await checkOllamaStatus();
+                setOllamaStatus(s);
+                const models = getChatModels(s);
+                if (models.length > 0) setSelectedModel(models[0]);
+              } catch (err) {
+                alert(`Failed to pull model: ${err instanceof Error ? err.message : String(err)}`);
+              }
+            }}
+          >
+            Download qwen2.5 Model
+          </button>
         </div>
       ) : (
         <div className="ai-chat">
