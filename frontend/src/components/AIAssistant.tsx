@@ -51,8 +51,8 @@ function OllamaSetup({ onReady }: { onReady: () => void }) {
       const result = await installOllama();
       setProgress(`Installed (${result.method}). Starting...`);
       await startOllama();
-      setProgress('Pulling llama3.2 model...');
-      await pullOllamaModel('llama3.2');
+      setProgress('Pulling qwen2.5 model...');
+      await pullOllamaModel('qwen2.5');
       setProgress('Ready!');
       onReady();
     } catch (err) {
@@ -91,7 +91,7 @@ function OllamaSetup({ onReady }: { onReady: () => void }) {
               fontSize: 14, fontWeight: 600, cursor: 'pointer', marginBottom: 12,
             }}
           >
-            Install Ollama + llama3.2
+            Install Ollama + qwen2.5
           </button>
           <p style={{ fontSize: 11, opacity: 0.6, textAlign: 'center' }}>
             Installs via Homebrew or ollama.com script
@@ -184,7 +184,7 @@ export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantPr
     setLoading(true);
 
     try {
-      const model = selectedModel || 'llama3.2:latest';
+      const model = selectedModel || 'qwen2.5:latest';
 
       const response = await aiQuery(
         text.trim(),
@@ -258,7 +258,7 @@ export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantPr
         <div className="ai-status">
           <p style={{ marginBottom: 12 }}>Ollama is running but no chat models found.</p>
           <p style={{ fontSize: 13, opacity: 0.8 }}>
-            Run: <code>ollama pull llama3.2</code>
+            Run: <code>ollama pull qwen2.5</code>
           </p>
         </div>
       ) : (

@@ -305,7 +305,7 @@ pub fn ai_query(
     );
 
     // Call Ollama (no DB lock held)
-    let model_name = model.unwrap_or_else(|| "llama3.2:latest".to_string());
+    let model_name = model.unwrap_or_else(|| "qwen2.5:latest".to_string());
     if model_name.len() > 64
         || !model_name
             .chars()
@@ -441,7 +441,7 @@ pub fn ai_explain(db: State<DbState>, verse_id: i64) -> Result<Value, String> {
     );
 
     let request_body = json!({
-        "model": "llama3.2:latest",
+        "model": "qwen2.5:latest",
         "prompt": prompt,
         "stream": false,
         "options": { "temperature": 0.3, "num_predict": 512 }
@@ -567,7 +567,7 @@ pub fn translate_chapter(
     );
 
     let request_body = json!({
-        "model": "llama3.2:latest",
+        "model": "qwen2.5:latest",
         "prompt": prompt,
         "stream": false,
         "options": { "temperature": 0.1, "num_predict": 4096 }
