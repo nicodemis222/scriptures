@@ -31,15 +31,23 @@ fn clear_caches_on_upgrade() {
         APP_VERSION
     );
 
-    // Clear Tauri WebKit/webview caches
+    // Clear Tauri WebKit/webview caches and Application Support webview data
     for dir in [
         format!("{}/Library/WebKit/{}", home, BUNDLE_ID),
         format!("{}/Library/Caches/{}", home, BUNDLE_ID),
         format!("{}/Library/WebKit/com.scriptures.app", home),
         format!("{}/Library/Caches/com.scriptures.app", home),
+        format!("{}/Library/Application Support/{}/EBWebView", home, BUNDLE_ID),
+        format!("{}/Library/Application Support/com.scriptures.app/EBWebView", home),
     ] {
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // Reset launch services to clear any cached app metadata
+    let _ = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -kill -r -domain local 2>/dev/null")
+        .output();
 
     // Clear TTS temp files from previous sessions
     let _ = std::fs::remove_dir_all("/tmp/scriptures_tts_chunks");

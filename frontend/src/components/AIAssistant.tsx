@@ -22,7 +22,7 @@ function getChatModels(status: OllamaStatus): string[] {
     .filter((name: string) => !name.includes('embed') && !name.includes('nomic'));
 }
 
-function OllamaSetup({ onReady }: { onReady: () => void }) {
+function AIEngineSetup({ onReady }: { onReady: () => void }) {
   const [status, setStatus] = useState<string>('checking');
   const [progress, setProgress] = useState('');
 
@@ -46,12 +46,12 @@ function OllamaSetup({ onReady }: { onReady: () => void }) {
   }, []);
 
   const handleInstall = async () => {
-    setProgress('Installing Ollama...');
+    setProgress('Installing AI engine...');
     try {
       const result = await installOllama();
       setProgress(`Installed (${result.method}). Starting...`);
       await startOllama();
-      setProgress('Pulling qwen2.5 model...');
+      setProgress('Downloading Qwen 2.5 model...');
       await pullOllamaModel('qwen2.5');
       setProgress('Ready!');
       onReady();
@@ -61,7 +61,7 @@ function OllamaSetup({ onReady }: { onReady: () => void }) {
   };
 
   const handleStart = async () => {
-    setProgress('Starting Ollama...');
+    setProgress('Starting AI engine...');
     try {
       await startOllama();
       setProgress('Checking for models...');
@@ -69,7 +69,7 @@ function OllamaSetup({ onReady }: { onReady: () => void }) {
       if (info.running) {
         onReady();
       } else {
-        setProgress('Ollama did not start. Try running "ollama serve" in a terminal.');
+        setProgress('AI engine did not start. Try running "ollama serve" in a terminal.');
       }
     } catch (err) {
       setProgress(`Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -78,11 +78,11 @@ function OllamaSetup({ onReady }: { onReady: () => void }) {
 
   return (
     <div className="ai-status" style={{ padding: '20px 16px' }}>
-      {status === 'checking' && <p>Checking Ollama status...</p>}
+      {status === 'checking' && <p>Checking AI engine status...</p>}
 
       {status === 'not_installed' && (
         <>
-          <p style={{ marginBottom: 16, fontSize: 14 }}>AI features require Ollama.</p>
+          <p style={{ marginBottom: 16, fontSize: 14 }}>AI features require a local AI engine to be installed.</p>
           <button
             onClick={() => void handleInstall()}
             style={{
@@ -91,17 +91,17 @@ function OllamaSetup({ onReady }: { onReady: () => void }) {
               fontSize: 14, fontWeight: 600, cursor: 'pointer', marginBottom: 12,
             }}
           >
-            Install Ollama + qwen2.5
+            Install AI Engine + Qwen 2.5
           </button>
           <p style={{ fontSize: 11, opacity: 0.6, textAlign: 'center' }}>
-            Installs via Homebrew or ollama.com script
+            Installs the local AI runtime and Qwen 2.5 model
           </p>
         </>
       )}
 
       {status === 'installed_not_running' && (
         <>
-          <p style={{ marginBottom: 16, fontSize: 14 }}>Ollama is installed but not running.</p>
+          <p style={{ marginBottom: 16, fontSize: 14 }}>AI engine is installed but not running.</p>
           <button
             onClick={() => void handleStart()}
             style={{
@@ -110,7 +110,7 @@ function OllamaSetup({ onReady }: { onReady: () => void }) {
               fontSize: 14, fontWeight: 600, cursor: 'pointer',
             }}
           >
-            Start Ollama
+            Start AI Engine
           </button>
         </>
       )}
@@ -125,7 +125,7 @@ function OllamaSetup({ onReady }: { onReady: () => void }) {
 }
 
 export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantProps) {
-  const [ollamaStatus, setOllamaStatus] = useState<OllamaStatus | null>(null);
+  const [aiStatus, setAiStatus] = useState<OllamaStatus | null>(null);
   const [checking, setChecking] = useState(true);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -133,7 +133,7 @@ export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantPr
   const [selectedModel, setSelectedModel] = useState<string>('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Check Ollama status and auto-detect best model
+  // Check AI engine status and auto-detect best model
   useEffect(() => {
     let cancelled = false;
     setChecking(true);
@@ -142,22 +142,20 @@ export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantPr
       try {
         const status = await checkOllamaStatus();
         if (cancelled) return;
-        setOllamaStatus(status);
+        setAiStatus(status);
 
         if (status.available) {
-          // Try to load saved model preference
           const savedModel = await getSetting('aiModel');
           const chatModels = getChatModels(status);
 
           if (savedModel && chatModels.includes(savedModel)) {
             setSelectedModel(savedModel);
           } else if (chatModels.length > 0) {
-            // Auto-select first available chat model
             setSelectedModel(chatModels[0]);
           }
         }
       } catch {
-        if (!cancelled) setOllamaStatus({ available: false, models: [] });
+        if (!cancelled) setAiStatus({ available: false, models: [] });
       } finally {
         if (!cancelled) setChecking(false);
       }
@@ -201,8 +199,8 @@ export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantPr
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
       let userFriendly = errorMsg;
-      if (errorMsg.includes('Ollama')) {
-        userFriendly = 'Could not reach Ollama. Make sure it is running (`ollama serve`).';
+      if (errorMsg.includes('Ollama') || errorMsg.includes('ollama')) {
+        userFriendly = 'Could not reach the AI engine. Make sure it is running.';
       } else if (errorMsg.includes('parse')) {
         userFriendly = 'Received an unexpected response from the model. Try a different model.';
       }
@@ -230,7 +228,7 @@ export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantPr
     void sendMessage(`What other scriptures relate to the themes in ${bookTitle} ${chapterNumber}?`);
   };
 
-  const chatModels = ollamaStatus ? getChatModels(ollamaStatus) : [];
+  const chatModels = aiStatus ? getChatModels(aiStatus) : [];
 
   return (
     <div className="ai-panel">
@@ -246,34 +244,34 @@ export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantPr
 
       {checking ? (
         <div className="ai-status">Checking AI availability...</div>
-      ) : !ollamaStatus?.available ? (
-        <OllamaSetup onReady={() => {
+      ) : !aiStatus?.available ? (
+        <AIEngineSetup onReady={() => {
           void checkOllamaStatus().then(s => {
-            setOllamaStatus(s);
+            setAiStatus(s);
             const models = getChatModels(s);
             if (models.length > 0) setSelectedModel(models[0]);
           });
         }} />
       ) : chatModels.length === 0 ? (
         <div className="ai-status">
-          <p style={{ marginBottom: 12 }}>Ollama is running but no chat models found.</p>
+          <p style={{ marginBottom: 12 }}>AI engine is running but no chat models found.</p>
           <button
             className="ai-action-btn"
             onClick={async () => {
               try {
                 const btn = document.querySelector('.ai-action-btn') as HTMLButtonElement;
-                if (btn) { btn.disabled = true; btn.textContent = 'Downloading qwen2.5... (this may take a minute)'; }
+                if (btn) { btn.disabled = true; btn.textContent = 'Downloading Qwen 2.5... (this may take a minute)'; }
                 await pullOllamaModel('qwen2.5');
                 const s = await checkOllamaStatus();
-                setOllamaStatus(s);
+                setAiStatus(s);
                 const models = getChatModels(s);
                 if (models.length > 0) setSelectedModel(models[0]);
               } catch (err) {
-                alert(`Failed to pull model: ${err instanceof Error ? err.message : String(err)}`);
+                alert(`Failed to download model: ${err instanceof Error ? err.message : String(err)}`);
               }
             }}
           >
-            Download qwen2.5 Model
+            Download Qwen 2.5 Model
           </button>
         </div>
       ) : (
