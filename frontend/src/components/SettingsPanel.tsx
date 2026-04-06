@@ -26,7 +26,7 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
   const [fontSize, setFontSize] = useState(18);
   const [language, setLanguage] = useState('English');
   const [ttsRate, setTtsRate] = useState(175);
-  const [aiModel, setAiModel] = useState('phi3:mini');
+  const [aiModel, setAiModel] = useState('qwen2.5:latest');
 
   useEffect(() => {
     loadSettings();
@@ -161,7 +161,7 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
               type="text"
               value={aiModel}
               onChange={(e) => handleAiModelChange(e.target.value)}
-              placeholder="phi3:mini"
+              placeholder="qwen2.5:latest"
             />
           </div>
         </section>
@@ -177,7 +177,7 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
           </div>
 
           <div className="settings-about">
-            <p><strong>Scriptures</strong> v0.1.0</p>
+            <p><strong>Scriptures</strong> v0.2.0</p>
             <p>A complete offline scripture study companion with highlights, notes, and AI-powered insights.</p>
           </div>
         </section>

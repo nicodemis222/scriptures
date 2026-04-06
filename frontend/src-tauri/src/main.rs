@@ -75,7 +75,8 @@ fn main() {
             app.manage(tts::TtsState::new());
             // Start Piper TTS server in background so voices are ready
             let tts_state = app.state::<tts::TtsState>();
-            tts::start_piper_on_launch(tts_state);
+            let app_handle = app.handle().clone();
+            tts::start_piper_on_launch(tts_state, app_handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -122,6 +123,7 @@ fn main() {
             tts::resume_reading,
             tts::stop_reading,
             tts::is_reading,
+            tts::tts_status,
             // AI + Ollama management
             ai::check_ollama_status,
             ai::check_ollama_installed,

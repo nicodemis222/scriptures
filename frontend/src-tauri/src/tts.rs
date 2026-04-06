@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::State;
+use tauri::{Emitter as _, State};
 
 pub struct TtsState {
     pub process: Arc<Mutex<Option<Child>>>,
@@ -69,34 +69,159 @@ impl Drop for TtsState {
 const PREFETCH_DIR: &str = "/tmp/scriptures_tts_chunks";
 const TTS_PORT: u16 = 8095;
 
-/// Start the Piper TTS server on app launch (called from setup, runs on background thread).
-pub fn start_piper_on_launch(tts: tauri::State<TtsState>) {
-    if piper_server_available() {
-        return;
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
+}
+
+fn venv_python_path() -> String {
+    format!("{}/.scriptures/piper-env/bin/python", home_dir())
+}
+
+fn venv_dir_path() -> String {
+    format!("{}/.scriptures/piper-env", home_dir())
+}
+
+/// Bootstrap the Piper Python venv if it doesn't exist.
+/// Emits tts-setup-progress events so the frontend can show status.
+fn ensure_piper_venv(emitter: &tauri::AppHandle) -> Result<(), String> {
+    let venv_dir = venv_dir_path();
+    let venv_python = venv_python_path();
+
+    // Already bootstrapped — check that piper is importable
+    if std::path::Path::new(&venv_python).exists() {
+        let check = Command::new(&venv_python)
+            .args(["-c", "import piper"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if check.map(|s| s.success()).unwrap_or(false) {
+            return Ok(());
+        }
+        // venv exists but piper not installed — remove and recreate
+        eprintln!("[tts] Existing venv missing piper, recreating...");
+        let _ = std::fs::remove_dir_all(&venv_dir);
     }
+
+    eprintln!("[tts] First launch: setting up voice engine...");
+    let _ = emitter.emit("tts-setup-progress", json!({
+        "stage": "creating-venv",
+        "message": "Creating voice engine environment..."
+    }));
+
+    let _ = std::fs::create_dir_all(format!("{}/.scriptures", home_dir()));
+
+    let venv_output = Command::new("python3")
+        .args(["-m", "venv", &venv_dir])
+        .output()
+        .map_err(|e| format!("python3 not found: {}. Install Xcode Command Line Tools.", e))?;
+
+    if !venv_output.status.success() {
+        let msg = format!("Failed to create venv: {}", String::from_utf8_lossy(&venv_output.stderr));
+        let _ = emitter.emit("tts-setup-progress", json!({"stage": "error", "message": &msg}));
+        return Err(msg);
+    }
+
+    let _ = emitter.emit("tts-setup-progress", json!({
+        "stage": "installing",
+        "message": "Downloading voice engine (this may take a minute)..."
+    }));
+
+    let pip = format!("{}/bin/pip", venv_dir);
+    let pip_output = Command::new(&pip)
+        .args(["install", "piper-tts", "onnxruntime"])
+        .output()
+        .map_err(|e| format!("pip install failed: {}", e))?;
+
+    if !pip_output.status.success() {
+        let stderr = String::from_utf8_lossy(&pip_output.stderr);
+        let _ = std::fs::remove_dir_all(&venv_dir);
+        let msg = format!("pip install failed: {}", stderr);
+        let _ = emitter.emit("tts-setup-progress", json!({"stage": "error", "message": &msg}));
+        return Err(msg);
+    }
+
+    let _ = emitter.emit("tts-setup-progress", json!({
+        "stage": "complete",
+        "message": "Voice engine ready!"
+    }));
+    eprintln!("[tts] Voice engine setup complete.");
+    Ok(())
+}
+
+/// Kill any stale process on the TTS port and spawn the Piper server.
+/// Returns the Child on success.
+fn spawn_piper_server() -> Option<Child> {
     let (python, server_py, model_dir) = piper_server_paths();
     if server_py.is_empty() || !std::path::Path::new(&python).exists() {
-        return;
+        eprintln!("[tts] Piper server.py not found or python missing");
+        return None;
     }
-    // Kill stale process on port
+
     let _ = Command::new("sh")
         .arg("-c")
         .arg(format!("lsof -ti:{} | xargs kill -9 2>/dev/null", TTS_PORT))
         .output();
 
-    let child = Command::new(&python)
+    Command::new(&python)
         .arg(&server_py)
         .env("TTS_PORT", TTS_PORT.to_string())
         .env("MODEL_DIR", &model_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn()
+        .ok()
+}
 
-    if let Ok(child) = child {
-        if let Ok(mut server) = tts.piper_server.lock() {
-            *server = Some(child);
-        }
+/// Start the Piper TTS server on app launch.
+/// Runs on a background thread so setup() returns immediately.
+pub fn start_piper_on_launch(tts: tauri::State<TtsState>, app_handle: tauri::AppHandle) {
+    if piper_server_available() {
+        return;
     }
+
+    let server_mutex = tts.piper_server.lock().ok().is_some(); // verify mutex works
+    let _ = server_mutex;
+    // Clone the inner Arc-wrapped mutex so the background thread can store the child
+    let piper_server: Arc<Mutex<Option<Child>>> = {
+        // We need access to tts.piper_server from the thread.
+        // Since tts is a State (ref), we can't move it. Store the child via a shared Arc.
+        // Actually, piper_server is a plain Mutex — we'll just set it after thread completes.
+        // Instead, use a shared Arc that the thread writes to and we read back.
+        Arc::new(Mutex::new(None))
+    };
+    let server_handle = piper_server.clone();
+
+    std::thread::spawn(move || {
+        // Bootstrap venv (may take time on first launch, emits progress events)
+        if let Err(e) = ensure_piper_venv(&app_handle) {
+            eprintln!("[tts] Failed to bootstrap piper venv: {}", e);
+            return;
+        }
+
+        if let Some(child) = spawn_piper_server() {
+            if let Ok(mut guard) = server_handle.lock() {
+                *guard = Some(child);
+            }
+        }
+    });
+}
+
+#[tauri::command]
+pub fn tts_status() -> Result<Value, String> {
+    let venv_exists = std::path::Path::new(&venv_python_path()).exists();
+    let server_running = piper_server_available();
+
+    Ok(json!({
+        "venv_ready": venv_exists,
+        "server_running": server_running,
+        "status": if server_running {
+            "ready"
+        } else if venv_exists {
+            "starting"
+        } else {
+            "bootstrapping"
+        }
+    }))
 }
 
 /// Validate voice ID: alphanumeric, hyphens, underscores only
@@ -123,30 +248,37 @@ fn piper_server_available() -> bool {
 
 /// Find the Piper TTS server.py and models directory.
 fn piper_server_paths() -> (String, String, String) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-
-    let venv_python = format!("{}/.scriptures/piper-env/bin/python", home);
+    let venv_python = venv_python_path();
     let python = if std::path::Path::new(&venv_python).exists() {
         venv_python
     } else {
         "python3".to_string()
     };
 
-    let server_locations = [
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|p| p.join("../Resources/piper/server.py")))
-            .unwrap_or_default(),
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("services/piper-tts/server.py"))
-            .unwrap_or_default(),
-        std::path::PathBuf::from(&home)
-            .join(".scriptures")
-            .join("piper")
-            .join("server.py"),
-    ];
+    // Build a list of candidate locations for server.py.
+    // Tauri maps `../../` resource paths to `_up_/_up_/` inside .app/Contents/Resources/.
+    let mut server_locations: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            let res = bin_dir.join("../Resources");
+            server_locations.push(res.join("_up_/_up_/services/piper-tts/server.py"));
+            server_locations.push(res.join("piper/server.py"));
+            server_locations.push(res.join("services/piper-tts/server.py"));
+        }
+    }
+    // Dev path (relative to Cargo.toml → frontend/src-tauri → ../../services)
+    if let Some(dev) = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("services/piper-tts/server.py"))
+    {
+        server_locations.push(dev);
+    }
+    // User home fallback
+    server_locations.push(
+        std::path::PathBuf::from(home_dir())
+            .join(".scriptures/piper/server.py"),
+    );
 
     let server_py = server_locations
         .iter()
@@ -331,28 +463,9 @@ pub fn is_prefetch_ready() -> Result<bool, String> {
     Ok(size > 1024)
 }
 
-/// Start Piper TTS server using venv Python + server.py (non-blocking on separate thread)
+/// Start Piper TTS server, waiting up to 10s for it to become available.
 fn auto_start_piper(tts: &State<TtsState>) -> bool {
-    let (python, server_py, model_dir) = piper_server_paths();
-    if server_py.is_empty() || !std::path::Path::new(&python).exists() {
-        return false;
-    }
-
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!("lsof -ti:{} | xargs kill -9 2>/dev/null", TTS_PORT))
-        .output();
-    std::thread::sleep(std::time::Duration::from_millis(300));
-
-    let child = Command::new(&python)
-        .arg(&server_py)
-        .env("TTS_PORT", TTS_PORT.to_string())
-        .env("MODEL_DIR", &model_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    if let Ok(child) = child {
+    if let Some(child) = spawn_piper_server() {
         if let Ok(mut server) = tts.piper_server.lock() {
             *server = Some(child);
         }

@@ -177,6 +177,16 @@ export async function isReading(): Promise<TtsStatus> {
   return invoke('is_reading');
 }
 
+export interface TtsSetupStatus {
+  venv_ready: boolean;
+  server_running: boolean;
+  status: 'ready' | 'starting' | 'bootstrapping';
+}
+
+export async function ttsSetupStatus(): Promise<TtsSetupStatus> {
+  return invoke('tts_status');
+}
+
 // AI
 export async function checkOllamaStatus(): Promise<OllamaStatus> {
   return invoke('check_ollama_status');

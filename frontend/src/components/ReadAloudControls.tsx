@@ -2,7 +2,9 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import {
   readAloud, pauseReading, resumeReading, stopReading, isReading,
   getSetting, setSetting, listVoices, prefetchAudio, isPrefetchReady,
+  ttsSetupStatus,
 } from '../hooks/useScriptures';
+import { listen } from '@tauri-apps/api/event';
 import type { VerseResult } from '../types/scriptures';
 import type { VoiceInfo } from '../hooks/useScriptures';
 import { PlayIcon, PauseIcon, StopIcon, SpeakerIcon } from './Icons';
@@ -21,7 +23,27 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
   const [showPlayer, setShowPlayer] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const [prefetched, setPrefetched] = useState(false);
+  const [setupMessage, setSetupMessage] = useState('');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const setupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Listen for TTS setup progress events (venv bootstrap on first launch)
+  useEffect(() => {
+    const unlisten = listen<{ stage: string; message: string }>('tts-setup-progress', (event) => {
+      const { stage, message } = event.payload;
+      if (setupTimerRef.current) clearTimeout(setupTimerRef.current);
+      if (stage === 'complete' || stage === 'error') {
+        setSetupMessage(message);
+        setupTimerRef.current = setTimeout(() => setSetupMessage(''), stage === 'complete' ? 3000 : 10000);
+      } else {
+        setSetupMessage(message);
+      }
+    });
+    return () => {
+      if (setupTimerRef.current) clearTimeout(setupTimerRef.current);
+      unlisten.then(fn => fn());
+    };
+  }, []);
 
   // Load voices on mount, retry if server isn't ready yet
   useEffect(() => {
@@ -40,13 +62,23 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
       } catch { /* unavailable */ }
       return false;
     };
-    // Try immediately, then retry every 3s for up to 30s (server may be starting)
+    // Try immediately, then retry every 3s for up to 60s (venv bootstrap may take time)
     void (async () => {
       if (await loadVoices()) return;
-      for (let i = 0; i < 10 && !cancelled; i++) {
+      // Check setup status to show info
+      try {
+        const status = await ttsSetupStatus();
+        if (status.status === 'bootstrapping') {
+          setSetupMessage('Setting up voices for first time...');
+        }
+      } catch { /* ignore */ }
+      for (let i = 0; i < 20 && !cancelled; i++) {
         await new Promise(r => setTimeout(r, 3000));
         if (cancelled) return;
-        if (await loadVoices()) return;
+        if (await loadVoices()) {
+          setSetupMessage('');
+          return;
+        }
       }
     })();
     return () => { cancelled = true; };
@@ -178,6 +210,11 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
 
   return (
     <>
+      {/* Setup progress banner */}
+      {setupMessage && (
+        <div className="tts-setup-banner">{setupMessage}</div>
+      )}
+
       {/* Inline controls */}
       {!showPlayer && (
         <div className="read-aloud-controls">

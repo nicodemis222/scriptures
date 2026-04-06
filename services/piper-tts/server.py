@@ -11,6 +11,7 @@ Endpoints:
 import io
 import json
 import os
+import socketserver
 import time
 import wave
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -56,6 +57,16 @@ def get_voice(requested_name=None):
         if voice:
             return voice, DEFAULT_MODEL
     return None, None
+
+
+class NoFQDNServer(HTTPServer):
+    """HTTPServer subclass that skips socket.getfqdn() in server_bind.
+    getfqdn() can hang for 30+ seconds on some macOS DNS configurations."""
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host or "localhost"
+        self.server_port = port
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -145,7 +156,7 @@ def main():
         print(f"[error] Failed to load default model. Place .onnx files in: {MODEL_DIR}")
         return
 
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = NoFQDNServer(("127.0.0.1", PORT), Handler)
     print(f"[server] Listening on :{PORT} (model: {_default_voice_name})")
     try:
         server.serve_forever()

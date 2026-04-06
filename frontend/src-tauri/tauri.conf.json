@@ -33,6 +33,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["../../data/scriptures.db"]
+    "resources": [
+      "../../data/scriptures.db",
+      "../../services/piper-tts/server.py",
+      "../../services/piper-tts/models/*"
+    ]
   }
 }
