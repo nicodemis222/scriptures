@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { VolumeNav } from './components/VolumeNav';
 import { BookList } from './components/BookList';
 import { ChapterGrid } from './components/ChapterGrid';
@@ -58,6 +59,30 @@ function App() {
   const [showTutorial, setShowTutorial] = useState(
     () => localStorage.getItem('tutorial_completed') !== 'true'
   );
+
+  // TTS setup progress (global banner)
+  const [ttsSetup, setTtsSetup] = useState<{ message: string; percent: number } | null>(null);
+  const ttsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    const unlisten = listen<{ stage: string; message: string; percent?: number }>('tts-setup-progress', (event) => {
+      const { stage, message, percent } = event.payload;
+      if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
+      if (stage === 'complete') {
+        setTtsSetup({ message, percent: 100 });
+        ttsTimerRef.current = setTimeout(() => setTtsSetup(null), 3000);
+      } else if (stage === 'error') {
+        setTtsSetup({ message, percent: 0 });
+        ttsTimerRef.current = setTimeout(() => setTtsSetup(null), 10000);
+      } else {
+        setTtsSetup({ message, percent: percent ?? 0 });
+      }
+    });
+    return () => {
+      if (ttsTimerRef.current) clearTimeout(ttsTimerRef.current);
+      unlisten.then(fn => fn());
+    };
+  }, []);
 
   const handleTutorialComplete = () => {
     setShowTutorial(false);
@@ -574,6 +599,25 @@ function App() {
           <BookOpen size={16} /> My Journey
         </button>
       </div>
+
+      {/* TTS setup progress banner */}
+      {ttsSetup && (
+        <div className="tts-global-banner">
+          <div className="tts-global-banner-text">
+            <span className="tts-global-banner-icon">&#9835;</span>
+            {ttsSetup.message}
+            {ttsSetup.percent > 0 && ttsSetup.percent < 100 && (
+              <span className="tts-global-banner-pct">{ttsSetup.percent}%</span>
+            )}
+          </div>
+          <div className="tts-global-banner-bar">
+            <div
+              className="tts-global-banner-fill"
+              style={{ width: `${ttsSetup.percent}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Main layout */}
       <div className="app-body">

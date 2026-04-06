@@ -112,7 +112,8 @@ fn ensure_piper_venv(emitter: &tauri::AppHandle) -> Result<(), String> {
     eprintln!("[tts] First launch: setting up voice engine...");
     let _ = emitter.emit("tts-setup-progress", json!({
         "stage": "creating-venv",
-        "message": "Creating voice engine environment..."
+        "message": "Setting up voice engine...",
+        "percent": 5
     }));
 
     let _ = std::fs::create_dir_all(format!("{}/.scriptures", home_dir()));
@@ -124,32 +125,69 @@ fn ensure_piper_venv(emitter: &tauri::AppHandle) -> Result<(), String> {
 
     if !venv_output.status.success() {
         let msg = format!("Failed to create venv: {}", String::from_utf8_lossy(&venv_output.stderr));
-        let _ = emitter.emit("tts-setup-progress", json!({"stage": "error", "message": &msg}));
+        let _ = emitter.emit("tts-setup-progress", json!({"stage": "error", "message": &msg, "percent": 0}));
         return Err(msg);
     }
 
     let _ = emitter.emit("tts-setup-progress", json!({
         "stage": "installing",
-        "message": "Downloading voice engine (this may take a minute)..."
+        "message": "Downloading voice engine — this may take a minute...",
+        "percent": 15
     }));
 
+    // Run pip with line-buffered output so we can report progress
     let pip = format!("{}/bin/pip", venv_dir);
-    let pip_output = Command::new(&pip)
-        .args(["install", "piper-tts", "onnxruntime"])
-        .output()
+    let pip_child = Command::new(&pip)
+        .args(["install", "--progress-bar", "off", "piper-tts", "onnxruntime"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("pip install failed to start: {}", e))?;
+
+    // Poll pip output for progress estimation while it runs
+    // pip install typically: collecting → downloading → installing
+    let emitter_clone = emitter.clone();
+    let progress_thread = std::thread::spawn(move || {
+        // Estimate progress based on elapsed time (pip doesn't give %)
+        // Typical install: ~30-50 seconds
+        let start = std::time::Instant::now();
+        let estimated_duration = std::time::Duration::from_secs(45);
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let elapsed = start.elapsed();
+            if elapsed > estimated_duration {
+                break;
+            }
+            // Map elapsed time to 15-85% range
+            let frac = elapsed.as_secs_f64() / estimated_duration.as_secs_f64();
+            let percent = 15.0 + frac * 70.0;
+            let _ = emitter_clone.emit("tts-setup-progress", json!({
+                "stage": "installing",
+                "message": "Downloading voice engine — this may take a minute...",
+                "percent": percent as u32
+            }));
+        }
+    });
+
+    let pip_output = pip_child.wait_with_output()
         .map_err(|e| format!("pip install failed: {}", e))?;
+
+    // Stop the progress thread (it'll finish on its own after estimated_duration)
+    let _ = progress_thread.join();
 
     if !pip_output.status.success() {
         let stderr = String::from_utf8_lossy(&pip_output.stderr);
         let _ = std::fs::remove_dir_all(&venv_dir);
-        let msg = format!("pip install failed: {}", stderr);
-        let _ = emitter.emit("tts-setup-progress", json!({"stage": "error", "message": &msg}));
+        let msg = format!("Voice engine install failed. Check your internet connection.");
+        eprintln!("[tts] pip install stderr: {}", stderr);
+        let _ = emitter.emit("tts-setup-progress", json!({"stage": "error", "message": &msg, "percent": 0}));
         return Err(msg);
     }
 
     let _ = emitter.emit("tts-setup-progress", json!({
         "stage": "complete",
-        "message": "Voice engine ready!"
+        "message": "Voice engine ready!",
+        "percent": 100
     }));
     eprintln!("[tts] Voice engine setup complete.");
     Ok(())

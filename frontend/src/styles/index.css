@@ -1185,14 +1185,47 @@ body {
   transition: background 0.3s ease, border-left 0.3s ease;
 }
 
-.tts-setup-banner {
-  padding: 6px 12px;
-  font-size: 12px;
+.tts-global-banner {
+  background: linear-gradient(135deg, rgba(197, 165, 90, 0.10), rgba(139, 115, 85, 0.06));
+  border-bottom: 1px solid var(--border-light);
+  padding: 8px 20px 6px;
+  flex-shrink: 0;
+}
+
+.tts-global-banner-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-family: var(--font-sans);
   color: var(--text-secondary, #8b7355);
-  background: var(--bg-secondary, rgba(139, 115, 85, 0.08));
-  border-radius: 6px;
-  margin-bottom: 6px;
-  text-align: center;
+  margin-bottom: 5px;
+}
+
+.tts-global-banner-icon {
+  font-size: 16px;
+  opacity: 0.7;
+}
+
+.tts-global-banner-pct {
+  margin-left: auto;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.tts-global-banner-bar {
+  height: 3px;
+  background: rgba(139, 115, 85, 0.12);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.tts-global-banner-fill {
+  height: 100%;
+  background: var(--accent, #c5a55a);
+  border-radius: 2px;
+  transition: width 0.8s ease;
 }
 
 .error-banner {
