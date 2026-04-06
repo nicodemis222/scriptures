@@ -1,8 +1,15 @@
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter as _, State};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerseInput {
+    pub id: i64,
+    pub text: String,
+}
 
 pub struct TtsState {
     pub process: Arc<Mutex<Option<Child>>>,
@@ -626,37 +633,172 @@ pub fn read_aloud(
 }
 
 #[tauri::command]
-pub fn pause_reading(tts: State<TtsState>) -> Result<(), String> {
-    tts.paused.store(true, Ordering::Relaxed);
-    // Also SIGSTOP current afplay if running
-    let proc = tts.process.lock().map_err(|e| e.to_string())?;
-    if let Some(ref child) = *proc {
-        #[cfg(unix)]
-        {
-            let pid = child.id();
-            if pid <= i32::MAX as u32 {
-                // SAFETY: SIGSTOP the afplay process
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP); }
+pub fn read_aloud_verses(
+    verses: Vec<VerseInput>,
+    rate: Option<f32>,
+    voice: Option<String>,
+    tts: State<TtsState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    // Kill existing playback
+    tts.cancelled.store(true, Ordering::Relaxed);
+    {
+        let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
+        if let Some(ref mut child) = *proc {
+            let _ = child.kill();
+        }
+        *proc = None;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    tts.cancelled.store(false, Ordering::Relaxed);
+    tts.paused.store(false, Ordering::Relaxed);
+
+    if !piper_server_available() && !auto_start_piper(&tts) {
+        return Err("Piper TTS server not available.".to_string());
+    }
+
+    if verses.is_empty() {
+        return Ok(());
+    }
+
+    let rate_val = rate.unwrap_or(175.0).clamp(50.0, 500.0);
+    let voice_id = voice
+        .filter(|v| is_valid_voice_id(v))
+        .unwrap_or_else(|| "en_US-lessac-high".to_string());
+
+    tts.playing.store(true, Ordering::Relaxed);
+
+    let cancelled = tts.cancelled.clone();
+    let paused = tts.paused.clone();
+    let playing = tts.playing.clone();
+    let process = tts.process.clone();
+
+    std::thread::spawn(move || {
+        play_verses(verses, voice_id, rate_val, cancelled, paused, playing, process, app_handle);
+    });
+
+    Ok(())
+}
+
+/// Play verse-by-verse, emitting tts-verse-playing events for each verse.
+fn play_verses(
+    verses: Vec<VerseInput>,
+    voice: String,
+    rate: f32,
+    cancelled: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    playing: Arc<AtomicBool>,
+    process: Arc<Mutex<Option<Child>>>,
+    emitter: tauri::AppHandle,
+) {
+    let rate_mult = format!("{:.2}", rate / 175.0);
+    let _ = std::fs::create_dir_all(PREFETCH_DIR);
+
+    for (i, verse) in verses.iter().enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Wait while paused
+        while paused.load(Ordering::Relaxed) {
+            if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Emit which verse is now playing
+        let _ = emitter.emit("tts-verse-playing", json!({"verseId": verse.id}));
+
+        // Synthesize the entire verse as one audio chunk
+        let wav_path = match synthesize_sentence(&verse.text, &voice, i) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Play with afplay
+        let child = Command::new("afplay")
+            .args(["-r", &rate_mult, &wav_path])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+
+        if let Ok(mut child) = child {
+            if let Ok(mut proc) = process.lock() {
+                *proc = Some(child);
+            } else {
+                let _ = child.wait();
+                continue;
+            }
+
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    if let Ok(mut proc) = process.lock() {
+                        if let Some(ref mut c) = *proc {
+                            let _ = c.kill();
+                        }
+                        *proc = None;
+                    }
+                    break;
+                }
+
+                // Check if paused — kill afplay cleanly instead of SIGSTOP
+                if paused.load(Ordering::Relaxed) {
+                    if let Ok(mut proc) = process.lock() {
+                        if let Some(ref mut c) = *proc {
+                            let _ = c.kill();
+                        }
+                        *proc = None;
+                    }
+                    break; // Will re-enter the outer loop and wait in the paused spin
+                }
+
+                if let Ok(mut proc) = process.lock() {
+                    if let Some(ref mut c) = *proc {
+                        match c.try_wait() {
+                            Ok(Some(_)) => { *proc = None; break; }
+                            Ok(None) => {}
+                            Err(_) => { *proc = None; break; }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     }
+
+    // Clear highlight
+    let _ = emitter.emit("tts-verse-playing", json!({"verseId": null}));
+    playing.store(false, Ordering::Relaxed);
+    let _ = std::fs::remove_dir_all(PREFETCH_DIR);
+}
+
+#[tauri::command]
+pub fn pause_reading(tts: State<TtsState>) -> Result<(), String> {
+    tts.paused.store(true, Ordering::Relaxed);
+    // Kill current afplay so pause is immediate (no SIGSTOP clipping).
+    // The play loop will wait at the paused check before the next sentence.
+    let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
+    if let Some(ref mut child) = *proc {
+        let _ = child.kill();
+    }
+    *proc = None;
     Ok(())
 }
 
 #[tauri::command]
 pub fn resume_reading(tts: State<TtsState>) -> Result<(), String> {
     tts.paused.store(false, Ordering::Relaxed);
-    let proc = tts.process.lock().map_err(|e| e.to_string())?;
-    if let Some(ref child) = *proc {
-        #[cfg(unix)]
-        {
-            let pid = child.id();
-            if pid <= i32::MAX as u32 {
-                // SAFETY: SIGCONT the afplay process
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT); }
-            }
-        }
-    }
     Ok(())
 }
 
@@ -668,17 +810,6 @@ pub fn stop_reading(tts: State<TtsState>) -> Result<(), String> {
 
     let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
     if let Some(ref mut child) = *proc {
-        #[cfg(unix)]
-        {
-            let pid = child.id();
-            if pid <= i32::MAX as u32 {
-                // SAFETY: Resume then kill
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGCONT);
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
-        }
         let _ = child.kill();
     }
     *proc = None;

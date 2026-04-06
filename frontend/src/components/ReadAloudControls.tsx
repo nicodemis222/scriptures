@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import {
-  readAloud, pauseReading, resumeReading, stopReading, isReading,
+  readAloudVerses, pauseReading, resumeReading, stopReading, isReading,
   getSetting, setSetting, listVoices, prefetchAudio, isPrefetchReady,
   ttsSetupStatus,
 } from '../hooks/useScriptures';
@@ -155,9 +155,9 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
     try {
       const rateSetting = await getSetting('ttsRate');
       const rate = rateSetting ? parseInt(rateSetting, 10) : 175;
-      const fullText = verses.map(v => v.text).join('. ');
+      const verseInputs = verses.map(v => ({ id: v.id, text: v.text }));
 
-      await readAloud(fullText, rate, selectedVoice);
+      await readAloudVerses(verseInputs, rate, selectedVoice);
       setPlaying(true);
       setPaused(false);
       setPreparing(false);

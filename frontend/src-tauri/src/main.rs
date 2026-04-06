@@ -119,6 +119,7 @@ fn main() {
             tts::prefetch_audio,
             tts::is_prefetch_ready,
             tts::read_aloud,
+            tts::read_aloud_verses,
             tts::pause_reading,
             tts::resume_reading,
             tts::stop_reading,

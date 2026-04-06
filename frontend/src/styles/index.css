@@ -1178,6 +1178,13 @@ body {
   padding: 40px 0;
 }
 
+.verse-reading-current {
+  background: rgba(197, 165, 90, 0.12);
+  border-left: 3px solid var(--accent);
+  padding-left: 8px !important;
+  transition: background 0.3s ease, border-left 0.3s ease;
+}
+
 .tts-setup-banner {
   padding: 6px 12px;
   font-size: 12px;

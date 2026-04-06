@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import type { VerseResult, Highlight, Note } from '../types/scriptures';
 import {
   getHighlightsForChapter,
@@ -10,6 +10,7 @@ import {
   deleteNote,
   translateChapter,
 } from '../hooks/useScriptures';
+import { listen } from '@tauri-apps/api/event';
 import { RelatedContent } from './RelatedContent';
 import { ReadAloudControls } from './ReadAloudControls';
 import { VerseToolbar } from './VerseToolbar';
@@ -108,6 +109,28 @@ export function VerseDisplay({
   const [selectionRange, setSelectionRange] = useState<SelectionRange | null>(null);
   const [toolbarPosition, setToolbarPosition] = useState<ToolbarPosition | null>(null);
   const [editingNoteVerseId, setEditingNoteVerseId] = useState<number | null>(null);
+  const [readingVerseId, setReadingVerseId] = useState<number | null>(null);
+  const readingVerseRef = useRef<number | null>(null);
+
+  // Listen for tts-verse-playing events to highlight + scroll to the current verse
+  useEffect(() => {
+    const unlisten = listen<{ verseId: number | null }>('tts-verse-playing', (event) => {
+      const { verseId } = event.payload;
+      setReadingVerseId(verseId);
+      readingVerseRef.current = verseId;
+      if (verseId != null) {
+        const el = document.querySelector(`[data-verse-id="${verseId}"]`);
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
+  // Clear highlight on chapter change
+  useEffect(() => {
+    setReadingVerseId(null);
+    readingVerseRef.current = null;
+  }, [bookTitle, chapterNumber]);
 
   // Translation state
   const [translations, setTranslations] = useState<Map<number, string>>(new Map());
@@ -419,7 +442,7 @@ export function VerseDisplay({
               <p
                 data-verse-id={v.id}
                 data-verse-text={v.text}
-                className="verse-line"
+                className={`verse-line${readingVerseId === v.id ? ' verse-reading-current' : ''}`}
                 onClick={() => handleVerseClick(v.id)}
                 onMouseUp={handleMouseUp}
                 style={{ cursor: 'text', borderRadius: 4, padding: '2px 4px', margin: '0 -4px 10px' }}

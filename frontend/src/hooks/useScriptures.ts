@@ -161,6 +161,17 @@ export async function readAloud(text: string, rate?: number, voice?: string): Pr
   return invoke('read_aloud', params);
 }
 
+export async function readAloudVerses(
+  verses: { id: number; text: string }[],
+  rate?: number,
+  voice?: string,
+): Promise<void> {
+  const params: Record<string, unknown> = { verses };
+  if (rate !== undefined) params.rate = rate;
+  if (voice !== undefined && voice !== 'default') params.voice = voice;
+  return invoke('read_aloud_verses', params);
+}
+
 export async function pauseReading(): Promise<void> {
   return invoke('pause_reading');
 }
