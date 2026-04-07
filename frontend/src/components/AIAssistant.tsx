@@ -353,7 +353,9 @@ export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantPr
             ))}
             {loading && (
               <div className="ai-message ai-message-assistant">
-                <div className="ai-message-content ai-thinking">Thinking...</div>
+                <div className="ai-message-content ai-thinking">
+                  Thinking<span className="ai-thinking-dots"><span>.</span><span>.</span><span>.</span><span>.</span></span>
+                </div>
               </div>
             )}
             <div ref={messagesEndRef} />
