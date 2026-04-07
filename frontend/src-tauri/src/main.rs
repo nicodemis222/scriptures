@@ -122,6 +122,7 @@ fn main() {
             tts::read_aloud_verses,
             tts::pause_reading,
             tts::resume_reading,
+            tts::skip_verse,
             tts::stop_reading,
             tts::is_reading,
             tts::tts_status,

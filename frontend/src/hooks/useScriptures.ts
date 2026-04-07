@@ -180,6 +180,10 @@ export async function resumeReading(): Promise<void> {
   return invoke('resume_reading');
 }
 
+export async function skipVerse(index: number): Promise<void> {
+  return invoke('skip_verse', { index });
+}
+
 export async function stopReading(): Promise<void> {
   return invoke('stop_reading');
 }

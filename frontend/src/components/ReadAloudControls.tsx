@@ -1,11 +1,12 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import {
   readAloudVerses, pauseReading, resumeReading, stopReading, isReading,
-  getSetting, setSetting, listVoices, prefetchAudio, isPrefetchReady,
+  skipVerse, getSetting, setSetting, listVoices, prefetchAudio, isPrefetchReady,
 } from '../hooks/useScriptures';
+import { listen } from '@tauri-apps/api/event';
 import type { VerseResult } from '../types/scriptures';
 import type { VoiceInfo } from '../hooks/useScriptures';
-import { PlayIcon, PauseIcon, StopIcon, SpeakerIcon } from './Icons';
+import { PlayIcon, PauseIcon, StopIcon, SpeakerIcon, SkipBackIcon, SkipForwardIcon } from './Icons';
 
 interface ReadAloudControlsProps {
   verses: VerseResult[];
@@ -21,7 +22,19 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
   const [showPlayer, setShowPlayer] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const [prefetched, setPrefetched] = useState(false);
+  const [verseIndex, setVerseIndex] = useState(0);
+  const [totalVerses, setTotalVerses] = useState(0);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Track current verse index from playback events
+  useEffect(() => {
+    const unlisten = listen<{ verseId: number | null; verseIndex?: number; totalVerses?: number }>('tts-verse-playing', (event) => {
+      const { verseIndex: idx, totalVerses: total } = event.payload;
+      if (idx != null) setVerseIndex(idx);
+      if (total != null) setTotalVerses(total);
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
 
   // Load voices on mount, retry if server isn't ready yet
   useEffect(() => {
@@ -140,6 +153,20 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
     }
   }, [verses, selectedVoice, startPoll]);
 
+  const handleSkipBack = useCallback(async () => {
+    const target = Math.max(0, verseIndex - 1);
+    try { await skipVerse(target); } catch { /* ignore */ }
+    setPlaying(true);
+    setPaused(false);
+  }, [verseIndex]);
+
+  const handleSkipForward = useCallback(async () => {
+    const target = Math.min(totalVerses - 1, verseIndex + 1);
+    try { await skipVerse(target); } catch { /* ignore */ }
+    setPlaying(true);
+    setPaused(false);
+  }, [verseIndex, totalVerses]);
+
   const handlePause = useCallback(async () => {
     try { await pauseReading(); } catch { /* ignore */ }
     setPaused(true);
@@ -221,6 +248,15 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
             </div>
 
             <div className="tts-player-controls">
+              <button
+                onClick={() => void handleSkipBack()}
+                className="tts-player-skip"
+                title="Previous verse"
+                disabled={preparing || verseIndex <= 0}
+              >
+                <SkipBackIcon size={16} />
+              </button>
+
               {preparing ? (
                 <div className="tts-player-main" style={{ opacity: 0.5 }}>
                   <SpeakerIcon size={18} className="playing" />
@@ -238,6 +274,15 @@ export function ReadAloudControls({ verses, bookTitle, chapterNumber }: ReadAlou
                   <PlayIcon size={18} />
                 </button>
               )}
+
+              <button
+                onClick={() => void handleSkipForward()}
+                className="tts-player-skip"
+                title="Next verse"
+                disabled={preparing || verseIndex >= totalVerses - 1}
+              >
+                <SkipForwardIcon size={16} />
+              </button>
             </div>
 
             <div className="tts-player-right">

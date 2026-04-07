@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter as _, State};
 
@@ -16,6 +16,8 @@ pub struct TtsState {
     pub paused: Arc<AtomicBool>,
     pub cancelled: Arc<AtomicBool>,
     pub playing: Arc<AtomicBool>,
+    /// Set to a verse index to skip to; -1 means no skip pending
+    pub skip_to: Arc<AtomicI64>,
     pub prefetch: Mutex<Option<Child>>,
     pub piper_server: Mutex<Option<Child>>,
 }
@@ -27,6 +29,7 @@ impl TtsState {
             paused: Arc::new(AtomicBool::new(false)),
             cancelled: Arc::new(AtomicBool::new(false)),
             playing: Arc::new(AtomicBool::new(false)),
+            skip_to: Arc::new(AtomicI64::new(-1)),
             prefetch: Mutex::new(None),
             piper_server: Mutex::new(None),
         }
@@ -691,6 +694,7 @@ pub fn read_aloud_verses(
 
     tts.cancelled.store(false, Ordering::Relaxed);
     tts.paused.store(false, Ordering::Relaxed);
+    tts.skip_to.store(-1, Ordering::Relaxed);
 
     if !piper_server_available() && !auto_start_piper(&tts) {
         return Err("Piper TTS server not available.".to_string());
@@ -711,15 +715,17 @@ pub fn read_aloud_verses(
     let paused = tts.paused.clone();
     let playing = tts.playing.clone();
     let process = tts.process.clone();
+    let skip_to = tts.skip_to.clone();
 
     std::thread::spawn(move || {
-        play_verses(verses, voice_id, rate_val, cancelled, paused, playing, process, app_handle);
+        play_verses(verses, voice_id, rate_val, cancelled, paused, playing, process, skip_to, app_handle);
     });
 
     Ok(())
 }
 
 /// Play verse-by-verse, emitting tts-verse-playing events for each verse.
+/// Supports skip_to for forward/back navigation.
 fn play_verses(
     verses: Vec<VerseInput>,
     voice: String,
@@ -728,19 +734,43 @@ fn play_verses(
     paused: Arc<AtomicBool>,
     playing: Arc<AtomicBool>,
     process: Arc<Mutex<Option<Child>>>,
+    skip_to: Arc<AtomicI64>,
     emitter: tauri::AppHandle,
 ) {
     let rate_mult = format!("{:.2}", rate / 175.0);
     let _ = std::fs::create_dir_all(PREFETCH_DIR);
+    let total = verses.len();
+    let mut i = 0usize;
 
-    for (i, verse) in verses.iter().enumerate() {
+    while i < total {
         if cancelled.load(Ordering::Relaxed) {
             break;
+        }
+
+        // Check for skip request
+        let skip = skip_to.swap(-1, Ordering::Relaxed);
+        if skip >= 0 {
+            let target = (skip as usize).min(total.saturating_sub(1));
+            i = target;
+            // Kill current afplay if playing
+            if let Ok(mut proc) = process.lock() {
+                if let Some(ref mut c) = *proc {
+                    let _ = c.kill();
+                }
+                *proc = None;
+            }
         }
 
         // Wait while paused
         while paused.load(Ordering::Relaxed) {
             if cancelled.load(Ordering::Relaxed) {
+                break;
+            }
+            // Also check skip while paused
+            let skip = skip_to.swap(-1, Ordering::Relaxed);
+            if skip >= 0 {
+                i = (skip as usize).min(total.saturating_sub(1));
+                paused.store(false, Ordering::Relaxed);
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -749,13 +779,19 @@ fn play_verses(
             break;
         }
 
-        // Emit which verse is now playing
-        let _ = emitter.emit("tts-verse-playing", json!({"verseId": verse.id}));
+        let verse = &verses[i];
+
+        // Emit which verse is now playing (include index + total for UI)
+        let _ = emitter.emit("tts-verse-playing", json!({
+            "verseId": verse.id,
+            "verseIndex": i,
+            "totalVerses": total
+        }));
 
         // Synthesize the entire verse as one audio chunk
         let wav_path = match synthesize_sentence(&verse.text, &voice, i) {
             Some(p) => p,
-            None => continue,
+            None => { i += 1; continue; },
         };
 
         if cancelled.load(Ordering::Relaxed) {
@@ -774,6 +810,7 @@ fn play_verses(
                 *proc = Some(child);
             } else {
                 let _ = child.wait();
+                i += 1;
                 continue;
             }
 
@@ -788,7 +825,19 @@ fn play_verses(
                     break;
                 }
 
-                // Check if paused — kill afplay cleanly instead of SIGSTOP
+                // Check for skip — kill current afplay and jump
+                let skip = skip_to.load(Ordering::Relaxed);
+                if skip >= 0 {
+                    if let Ok(mut proc) = process.lock() {
+                        if let Some(ref mut c) = *proc {
+                            let _ = c.kill();
+                        }
+                        *proc = None;
+                    }
+                    break; // Outer loop will handle the skip
+                }
+
+                // Check if paused — kill afplay cleanly
                 if paused.load(Ordering::Relaxed) {
                     if let Ok(mut proc) = process.lock() {
                         if let Some(ref mut c) = *proc {
@@ -796,7 +845,7 @@ fn play_verses(
                         }
                         *proc = None;
                     }
-                    break; // Will re-enter the outer loop and wait in the paused spin
+                    break;
                 }
 
                 if let Ok(mut proc) = process.lock() {
@@ -812,6 +861,11 @@ fn play_verses(
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
+        }
+
+        // Only advance if no skip is pending (skip handling sets i directly)
+        if skip_to.load(Ordering::Relaxed) < 0 {
+            i += 1;
         }
     }
 
@@ -837,6 +891,18 @@ pub fn pause_reading(tts: State<TtsState>) -> Result<(), String> {
 #[tauri::command]
 pub fn resume_reading(tts: State<TtsState>) -> Result<(), String> {
     tts.paused.store(false, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn skip_verse(index: i64, tts: State<TtsState>) -> Result<(), String> {
+    tts.skip_to.store(index, Ordering::Relaxed);
+    // Kill current afplay so skip is immediate
+    let mut proc = tts.process.lock().map_err(|e| e.to_string())?;
+    if let Some(ref mut child) = *proc {
+        let _ = child.kill();
+    }
+    *proc = None;
     Ok(())
 }
 

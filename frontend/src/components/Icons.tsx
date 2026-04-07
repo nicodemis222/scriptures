@@ -436,6 +436,18 @@ export const StopIcon: React.FC<IconProps> = ({ size = 24, className }) => (
   </svg>
 );
 
+export const SkipBackIcon: React.FC<IconProps> = ({ size = 24, className }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className}>
+    <path d="M6 6h2v12H6zm3.5 6l8.5 6V6z" />
+  </svg>
+);
+
+export const SkipForwardIcon: React.FC<IconProps> = ({ size = 24, className }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="currentColor" className={className}>
+    <path d="M16 6h2v12h-2zm-10 0l8.5 6L6 18z" />
+  </svg>
+);
+
 export const XIcon: React.FC<IconProps> = ({ size = 24, className }) => (
   <svg
     width={size}
