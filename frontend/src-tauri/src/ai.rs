@@ -64,45 +64,79 @@ pub fn check_ollama_status() -> Result<Value, String> {
 
 // ── Ollama Management ──
 
-#[tauri::command]
-pub fn check_ollama_installed() -> Result<Value, String> {
-    let installed = std::process::Command::new("which")
-        .arg("ollama")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let running = std::process::Command::new("curl")
+/// Find the ollama binary, checking multiple locations.
+fn find_ollama() -> Option<String> {
+    let candidates = [
+        "/usr/local/bin/ollama",
+        "/opt/homebrew/bin/ollama",
+        "/Applications/Ollama.app/Contents/Resources/ollama",
+    ];
+    // Check PATH first
+    if let Ok(output) = std::process::Command::new("which").arg("ollama").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(path);
+            }
+        }
+    }
+    // Check known locations
+    for path in &candidates {
+        if std::path::Path::new(path).exists() {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+fn ollama_api_available() -> bool {
+    std::process::Command::new("curl")
         .args(["-s", "--connect-timeout", "1", "http://localhost:11434/api/tags"])
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+pub fn check_ollama_installed() -> Result<Value, String> {
+    let installed = find_ollama().is_some();
+    let running = ollama_api_available();
     Ok(json!({"installed": installed, "running": running}))
 }
 
 #[tauri::command]
 pub fn install_ollama() -> Result<Value, String> {
-    if std::process::Command::new("which")
-        .arg("ollama")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if find_ollama().is_some() {
         return Ok(json!({"status": "already_installed"}));
     }
     if cfg!(target_os = "macos") {
+        // Try brew first
         match std::process::Command::new("brew")
             .args(["install", "ollama"])
             .output()
         {
             Ok(o) if o.status.success() => Ok(json!({"status": "installed", "method": "brew"})),
             _ => {
+                // Download Ollama.app directly (avoids sudo symlink issue)
+                let script = r#"
+                    cd /tmp
+                    curl -fsSL -o ollama-darwin.tgz https://ollama.com/download/Ollama-darwin.zip 2>/dev/null \
+                    || curl -fsSL -o ollama-darwin.tgz https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip
+                    if [ -f ollama-darwin.tgz ]; then
+                        rm -rf /Applications/Ollama.app
+                        unzip -o ollama-darwin.tgz -d /Applications/ 2>/dev/null
+                        rm -f ollama-darwin.tgz
+                    fi
+                "#;
                 let output = std::process::Command::new("sh")
                     .arg("-c")
-                    .arg("curl -fsSL https://ollama.com/install.sh | sh")
+                    .arg(script)
                     .output()
                     .map_err(|e| format!("Install failed: {}", e))?;
-                if output.status.success() {
-                    Ok(json!({"status": "installed", "method": "curl"}))
+
+                // Verify it worked
+                if std::path::Path::new("/Applications/Ollama.app/Contents/Resources/ollama").exists() {
+                    Ok(json!({"status": "installed", "method": "direct"}))
                 } else {
                     Err(format!(
                         "Install failed: {}",
@@ -118,26 +152,18 @@ pub fn install_ollama() -> Result<Value, String> {
 
 #[tauri::command]
 pub fn start_ollama() -> Result<Value, String> {
-    if std::process::Command::new("curl")
-        .args(["-s", "--connect-timeout", "1", "http://localhost:11434/api/tags"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if ollama_api_available() {
         return Ok(json!({"status": "already_running"}));
     }
-    let _child = std::process::Command::new("ollama")
+    let ollama = find_ollama().ok_or("Ollama not found. Click Install first.")?;
+    let _child = std::process::Command::new(&ollama)
         .arg("serve")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| format!("Failed: {}", e))?;
+        .map_err(|e| format!("Failed to start: {}", e))?;
     std::thread::sleep(std::time::Duration::from_secs(2));
-    let running = std::process::Command::new("curl")
-        .args(["-s", "--connect-timeout", "2", "http://localhost:11434/api/tags"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let running = ollama_api_available();
     Ok(json!({"status": if running { "started" } else { "starting" }}))
 }
 
@@ -150,7 +176,8 @@ pub fn pull_ollama_model(model: String) -> Result<Value, String> {
     {
         return Err("Invalid model name".to_string());
     }
-    let output = std::process::Command::new("ollama")
+    let ollama = find_ollama().ok_or("Ollama not found. Click Install first.")?;
+    let output = std::process::Command::new(&ollama)
         .args(["pull", &model])
         .output()
         .map_err(|e| format!("Failed: {}", e))?;
