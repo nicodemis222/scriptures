@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { checkOllamaStatus, aiQuery, getSetting, setSetting, checkOllamaInstalled, installOllama, startOllama, pullOllamaModel } from '../hooks/useScriptures';
+import { listen } from '@tauri-apps/api/event';
 import type { OllamaStatus } from '../types/scriptures';
 import { BrainIcon, XIcon } from './Icons';
 
@@ -25,6 +26,8 @@ function getChatModels(status: OllamaStatus): string[] {
 function AIEngineSetup({ onReady }: { onReady: () => void }) {
   const [status, setStatus] = useState<string>('checking');
   const [progress, setProgress] = useState('');
+  const [pullPercent, setPullPercent] = useState(0);
+  const [pulling, setPulling] = useState(false);
 
   useEffect(() => {
     void (async () => {
@@ -45,17 +48,33 @@ function AIEngineSetup({ onReady }: { onReady: () => void }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Listen for model pull progress events
+  useEffect(() => {
+    const unlisten = listen<{ status: string; message: string; percent: number; completed: number; total: number }>('ollama-pull-progress', (event) => {
+      const { message, percent } = event.payload;
+      setProgress(message);
+      if (percent > 0) setPullPercent(percent);
+    });
+    return () => { unlisten.then(fn => fn()); };
+  }, []);
+
   const handleInstall = async () => {
     setProgress('Installing AI engine...');
+    setPulling(false);
     try {
       const result = await installOllama();
       setProgress(`Installed (${result.method}). Starting...`);
       await startOllama();
-      setProgress('Downloading Qwen 2.5 model...');
+      setProgress('Downloading Qwen 2.5...');
+      setPulling(true);
+      setPullPercent(0);
       await pullOllamaModel('qwen2.5');
       setProgress('Ready!');
+      setPulling(false);
+      setPullPercent(100);
       onReady();
     } catch (err) {
+      setPulling(false);
       setProgress(`Error: ${err instanceof Error ? err.message : String(err)}`);
     }
   };
@@ -80,15 +99,17 @@ function AIEngineSetup({ onReady }: { onReady: () => void }) {
     <div className="ai-status" style={{ padding: '20px 16px' }}>
       {status === 'checking' && <p>Checking AI engine status...</p>}
 
-      {status === 'not_installed' && (
+      {status === 'not_installed' && !pulling && (
         <>
           <p style={{ marginBottom: 16, fontSize: 14 }}>AI features require a local AI engine to be installed.</p>
           <button
             onClick={() => void handleInstall()}
+            disabled={!!progress && !progress.startsWith('Error')}
             style={{
               width: '100%', padding: '12px', background: 'var(--accent)', color: 'white',
               border: 'none', borderRadius: '8px', fontFamily: 'var(--font-sans)',
               fontSize: 14, fontWeight: 600, cursor: 'pointer', marginBottom: 12,
+              opacity: progress && !progress.startsWith('Error') ? 0.6 : 1,
             }}
           >
             Install AI Engine + Qwen 2.5
@@ -116,9 +137,32 @@ function AIEngineSetup({ onReady }: { onReady: () => void }) {
       )}
 
       {progress && (
-        <p style={{ marginTop: 12, fontSize: 12, color: 'var(--accent)', textAlign: 'center' }}>
-          {progress}
-        </p>
+        <div style={{ marginTop: 16 }}>
+          <p style={{ fontSize: 12, color: 'var(--accent)', textAlign: 'center', marginBottom: 8 }}>
+            {progress}
+          </p>
+          {pulling && (
+            <div style={{ marginTop: 4 }}>
+              <div style={{
+                display: 'flex', justifyContent: 'space-between', fontSize: 11,
+                color: 'var(--text-secondary)', marginBottom: 4,
+              }}>
+                <span>Downloading model</span>
+                <span style={{ fontWeight: 600, color: 'var(--accent)' }}>{pullPercent}%</span>
+              </div>
+              <div style={{
+                height: 4, background: 'rgba(139, 115, 85, 0.15)',
+                borderRadius: 2, overflow: 'hidden',
+              }}>
+                <div style={{
+                  height: '100%', width: `${pullPercent}%`,
+                  background: 'var(--accent)', borderRadius: 2,
+                  transition: 'width 0.5s ease',
+                }} />
+              </div>
+            </div>
+          )}
+        </div>
       )}
     </div>
   );
