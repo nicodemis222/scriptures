@@ -51,11 +51,21 @@ function AIEngineSetup({ onReady }: { onReady: () => void }) {
   // Listen for model pull progress events
   useEffect(() => {
     const unlisten = listen<{ status: string; message: string; percent: number; completed: number; total: number }>('ollama-pull-progress', (event) => {
-      const { message, percent } = event.payload;
+      const { status: evtStatus, message, percent } = event.payload;
       setProgress(message);
       if (percent > 0) setPullPercent(percent);
+      if (evtStatus === 'success') {
+        setPulling(false);
+        setPullPercent(100);
+        setProgress('Ready!');
+        onReady();
+      } else if (evtStatus === 'error') {
+        setPulling(false);
+        setPullPercent(0);
+      }
     });
     return () => { unlisten.then(fn => fn()); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleInstall = async () => {
@@ -68,11 +78,8 @@ function AIEngineSetup({ onReady }: { onReady: () => void }) {
       setProgress('Downloading Qwen 2.5...');
       setPulling(true);
       setPullPercent(0);
+      // This returns immediately — progress comes via events
       await pullOllamaModel('qwen2.5');
-      setProgress('Ready!');
-      setPulling(false);
-      setPullPercent(100);
-      onReady();
     } catch (err) {
       setPulling(false);
       setProgress(`Error: ${err instanceof Error ? err.message : String(err)}`);
@@ -304,12 +311,19 @@ export function AIAssistant({ bookTitle, chapterNumber, onClose }: AIAssistantPr
             onClick={async () => {
               try {
                 const btn = document.querySelector('.ai-action-btn') as HTMLButtonElement;
-                if (btn) { btn.disabled = true; btn.textContent = 'Downloading Qwen 2.5... (this may take a minute)'; }
+                if (btn) { btn.disabled = true; btn.textContent = 'Downloading Qwen 2.5...'; }
+                // Returns immediately — progress via events, completion triggers onReady-like refresh
                 await pullOllamaModel('qwen2.5');
-                const s = await checkOllamaStatus();
-                setAiStatus(s);
-                const models = getChatModels(s);
-                if (models.length > 0) setSelectedModel(models[0]);
+                // Poll for completion since the pull is now async
+                const poll = setInterval(async () => {
+                  const s = await checkOllamaStatus();
+                  const models = getChatModels(s);
+                  if (models.length > 0) {
+                    clearInterval(poll);
+                    setAiStatus(s);
+                    setSelectedModel(models[0]);
+                  }
+                }, 3000);
               } catch (err) {
                 alert(`Failed to download model: ${err instanceof Error ? err.message : String(err)}`);
               }

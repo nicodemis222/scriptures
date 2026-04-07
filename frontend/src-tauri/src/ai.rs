@@ -178,68 +178,101 @@ pub fn pull_ollama_model(model: String, app_handle: tauri::AppHandle) -> Result<
         return Err("Invalid model name".to_string());
     }
 
-    // Use the Ollama REST API for streaming progress instead of CLI
-    // POST /api/pull streams NDJSON lines with {status, completed, total}
-    let child = std::process::Command::new("curl")
-        .args([
-            "-sN",
-            "--connect-timeout", "10",
-            "--max-time", "600",
-            "-X", "POST",
-            "http://localhost:11434/api/pull",
-            "-H", "Content-Type: application/json",
-            "-d", &json!({"name": model}).to_string(),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to start pull: {}", e))?;
+    // Spawn the download on a background thread so the UI stays responsive.
+    // Progress is reported via ollama-pull-progress events.
+    // Completion is signaled via ollama-pull-progress with status "success" or "error".
+    let model_clone = model.clone();
+    std::thread::spawn(move || {
+        let child = std::process::Command::new("curl")
+            .args([
+                "-sN",
+                "--connect-timeout", "10",
+                "--max-time", "900",
+                "-X", "POST",
+                "http://localhost:11434/api/pull",
+                "-H", "Content-Type: application/json",
+                "-d", &json!({"name": model_clone}).to_string(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn();
 
-    let stdout = child.stdout.ok_or("Failed to capture pull output")?;
-    let reader = std::io::BufReader::new(stdout);
-    let mut last_pct: i64 = -1;
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        if line.is_empty() { continue; }
-
-        if let Ok(data) = serde_json::from_str::<Value>(&line) {
-            let status = data.get("status").and_then(|s| s.as_str()).unwrap_or("");
-            let completed = data.get("completed").and_then(|v| v.as_u64()).unwrap_or(0);
-            let total = data.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-
-            let (message, percent) = if total > 0 {
-                let pct = ((completed as f64 / total as f64) * 100.0) as i64;
-                let size_mb = total / 1_048_576;
-                let done_mb = completed / 1_048_576;
-                (format!("{} — {} / {} MB", status, done_mb, size_mb), pct)
-            } else {
-                (status.to_string(), -1)
-            };
-
-            // Only emit when percentage changes (avoid spamming)
-            if percent != last_pct || total == 0 {
-                last_pct = percent;
+        let child = match child {
+            Ok(c) => c,
+            Err(e) => {
                 let _ = app_handle.emit("ollama-pull-progress", json!({
-                    "status": status,
-                    "message": message,
-                    "percent": if percent >= 0 { percent } else { 0 },
-                    "completed": completed,
-                    "total": total,
+                    "status": "error", "message": format!("Failed to start: {}", e),
+                    "percent": 0, "completed": 0, "total": 0,
                 }));
+                return;
             }
+        };
 
-            // Check for error
-            if let Some(err) = data.get("error").and_then(|e| e.as_str()) {
-                return Err(format!("Pull failed: {}", err));
+        let stdout = match child.stdout {
+            Some(s) => s,
+            None => {
+                let _ = app_handle.emit("ollama-pull-progress", json!({
+                    "status": "error", "message": "Failed to capture output",
+                    "percent": 0, "completed": 0, "total": 0,
+                }));
+                return;
+            }
+        };
+
+        let reader = std::io::BufReader::new(stdout);
+        let mut last_pct: i64 = -1;
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.is_empty() { continue; }
+
+            if let Ok(data) = serde_json::from_str::<Value>(&line) {
+                let status_str = data.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                let completed = data.get("completed").and_then(|v| v.as_u64()).unwrap_or(0);
+                let total = data.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                let (message, percent) = if total > 0 {
+                    let pct = ((completed as f64 / total as f64) * 100.0) as i64;
+                    let size_mb = total / 1_048_576;
+                    let done_mb = completed / 1_048_576;
+                    (format!("{} — {} / {} MB", status_str, done_mb, size_mb), pct)
+                } else {
+                    (status_str.to_string(), -1)
+                };
+
+                if percent != last_pct || total == 0 {
+                    last_pct = percent;
+                    let _ = app_handle.emit("ollama-pull-progress", json!({
+                        "status": status_str,
+                        "message": message,
+                        "percent": if percent >= 0 { percent } else { 0 },
+                        "completed": completed,
+                        "total": total,
+                    }));
+                }
+
+                if let Some(err) = data.get("error").and_then(|e| e.as_str()) {
+                    let _ = app_handle.emit("ollama-pull-progress", json!({
+                        "status": "error", "message": format!("Pull failed: {}", err),
+                        "percent": 0, "completed": 0, "total": 0,
+                    }));
+                    return;
+                }
             }
         }
-    }
 
-    Ok(json!({"status": "pulled", "model": model}))
+        // Signal completion
+        let _ = app_handle.emit("ollama-pull-progress", json!({
+            "status": "success", "message": "Model ready!",
+            "percent": 100, "completed": 0, "total": 0,
+        }));
+    });
+
+    // Return immediately — UI stays responsive
+    Ok(json!({"status": "pulling", "model": model}))
 }
 
 // ── RAG Retrieval ──
