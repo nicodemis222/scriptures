@@ -12,6 +12,7 @@ import { StudyView } from './components/StudyView';
 import { SettingsPanel } from './components/SettingsPanel';
 import { MyJourney } from './components/MyJourney';
 import { AIAssistant } from './components/AIAssistant';
+import { FirstRunSetup } from './components/FirstRunSetup';
 import { ToastContainer } from './components/Toast';
 import {
   SunIcon,
@@ -60,6 +61,11 @@ function App() {
     () => localStorage.getItem('tutorial_completed') !== 'true'
   );
 
+  // First-run AI setup (shown after tutorial on fresh install)
+  const [showFirstRunSetup, setShowFirstRunSetup] = useState(
+    () => localStorage.getItem('setup_completed') !== 'true'
+  );
+
   // TTS setup progress (global banner)
   const [ttsSetup, setTtsSetup] = useState<{ message: string; percent: number } | null>(null);
   const ttsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -91,6 +97,11 @@ function App() {
 
   const handleShowTutorial = () => {
     setShowTutorial(true);
+  };
+
+  const handleFirstRunSetupComplete = () => {
+    setShowFirstRunSetup(false);
+    localStorage.setItem('setup_completed', 'true');
   };
 
   // Dark mode
@@ -660,6 +671,11 @@ function App() {
 
       {/* Tutorial overlay */}
       {showTutorial && <Tutorial onComplete={handleTutorialComplete} />}
+
+      {/* First-run AI setup — shown after tutorial is dismissed */}
+      {!showTutorial && showFirstRunSetup && (
+        <FirstRunSetup onComplete={handleFirstRunSetupComplete} />
+      )}
 
       <ToastContainer />
     </div>

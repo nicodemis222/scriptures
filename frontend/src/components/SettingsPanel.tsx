@@ -26,7 +26,6 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
   const [fontSize, setFontSize] = useState(18);
   const [language, setLanguage] = useState('English');
   const [ttsRate, setTtsRate] = useState(175);
-  const [aiModel, setAiModel] = useState('qwen2.5:latest');
 
   useEffect(() => {
     loadSettings();
@@ -34,16 +33,14 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
 
   async function loadSettings() {
     try {
-      const [fs, lang, rate, model] = await Promise.all([
+      const [fs, lang, rate] = await Promise.all([
         getSetting('fontSize'),
         getSetting('language'),
         getSetting('ttsRate'),
-        getSetting('aiModel'),
       ]);
       if (fs) setFontSize(parseInt(fs, 10));
       if (lang) setLanguage(lang);
       if (rate) setTtsRate(parseInt(rate, 10));
-      if (model) setAiModel(model);
     } catch (err) {
       console.error('Failed to load settings:', err);
     }
@@ -63,11 +60,6 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
   function handleTtsRateChange(rate: number) {
     setTtsRate(rate);
     setSetting('ttsRate', String(rate));
-  }
-
-  function handleAiModelChange(model: string) {
-    setAiModel(model);
-    setSetting('aiModel', model);
   }
 
   return (
@@ -127,7 +119,7 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
           </div>
 
           <p className="settings-note">
-            Translation uses Qwen AI. Select a language here as default, or use the language dropdown in the verse reader to translate on the fly. Requires the AI engine to be running.
+            Translation uses the local Mistral AI engine. Select a language here as default, or use the language dropdown in the verse reader to translate on the fly. Requires the AI engine to be running.
           </p>
         </section>
 
@@ -152,18 +144,10 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
           <h3>AI Assistant</h3>
 
           <p className="settings-note">
-            Requires the AI engine to be running. Set up from the Scripture Assistant panel.
+            Powered by the local <strong>Mistral 7B</strong> model. AI features (Scripture Assistant,
+            My Journey, Verse Explain, Translation) all use this single engine —
+            no model selection needed. Set up at first launch.
           </p>
-
-          <div className="settings-row">
-            <label>Model</label>
-            <input
-              type="text"
-              value={aiModel}
-              onChange={(e) => handleAiModelChange(e.target.value)}
-              placeholder="qwen2.5:latest"
-            />
-          </div>
         </section>
 
         {/* Help */}
@@ -177,7 +161,7 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
           </div>
 
           <div className="settings-about">
-            <p><strong>Scriptures</strong> v0.2.0</p>
+            <p><strong>Scriptures</strong> v0.3.0</p>
             <p>A complete offline scripture study companion with highlights, notes, and AI-powered insights.</p>
           </div>
         </section>

@@ -4,6 +4,10 @@ use std::collections::HashSet;
 use std::io::BufRead;
 use tauri::{Emitter as _, State};
 
+/// The ONLY AI model used by Scripture Assistant, My Journey, Verse Explain,
+/// and Translation. Do not read from settings — this is intentionally fixed.
+pub const AI_MODEL: &str = "mistral:7b";
+
 /// Helper to call Ollama API via curl with proper timeouts.
 fn call_ollama(endpoint: &str, body: &Value) -> Result<Value, String> {
     let url = format!("http://localhost:11434{}", endpoint);
@@ -519,15 +523,9 @@ pub fn ai_query(
         scripture_context, prompt
     );
 
-    // Call Ollama (no DB lock held)
-    let model_name = model.unwrap_or_else(|| "qwen2.5:latest".to_string());
-    if model_name.len() > 64
-        || !model_name
-            .chars()
-            .all(|c| c.is_alphanumeric() || ":.-_".contains(c))
-    {
-        return Err("Invalid model name".to_string());
-    }
+    // Call Ollama (no DB lock held). Model is fixed — user cannot override.
+    let _ = model; // accept for backward compat, ignore
+    let model_name = AI_MODEL.to_string();
     let request_body = json!({
         "model": model_name,
         "prompt": augmented_prompt,
@@ -656,7 +654,7 @@ pub fn ai_explain(db: State<DbState>, verse_id: i64) -> Result<Value, String> {
     );
 
     let request_body = json!({
-        "model": "qwen2.5:latest",
+        "model": AI_MODEL,
         "prompt": prompt,
         "stream": false,
         "options": { "temperature": 0.3, "num_predict": 512 }
@@ -782,7 +780,7 @@ pub fn translate_chapter(
     );
 
     let request_body = json!({
-        "model": "qwen2.5:latest",
+        "model": AI_MODEL,
         "prompt": prompt,
         "stream": false,
         "options": { "temperature": 0.1, "num_predict": 4096 }

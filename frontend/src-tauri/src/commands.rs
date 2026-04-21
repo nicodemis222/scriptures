@@ -612,7 +612,6 @@ const VALID_SETTING_KEYS: &[&str] = &[
     "language",
     "ttsRate",
     "ttsVoice",
-    "aiModel",
     "theme",
     "journeyData",
 ];
@@ -642,15 +641,6 @@ pub fn set_setting(db: State<DbState>, key: String, value: String) -> Result<Val
     validate_setting_key(&key)?;
     // Validate specific setting values
     match key.as_str() {
-        "aiModel" => {
-            if value.len() > 64
-                || !value
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || ":.-_".contains(c))
-            {
-                return Err("Invalid AI model name".to_string());
-            }
-        }
         "fontSize" => {
             let size: i32 = value.parse().map_err(|_| "Invalid font size")?;
             if !(10..=48).contains(&size) {
