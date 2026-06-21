@@ -272,9 +272,12 @@ export function FirstRunSetup({ onComplete }: FirstRunSetupProps) {
         </div>
 
         <p className="first-run-footnote">
-          Scriptures works fully offline. AI features (Scripture Assistant, My Journey,
-          Verse Explain, Translation) require the local Mistral 7B engine. You can
-          skip now and set it up later from the Scripture Assistant panel.
+          <strong>Everything except AI works right now</strong> — reading, search,
+          highlights, notes, hymns, and Read Aloud need no setup. The optional AI
+          features (Scripture Assistant, My Journey, Verse Explain, Translation) run a
+          local Mistral 7B engine — a <strong>one-time ~4.3 GB download that needs
+          internet</strong>. You can skip and set it up anytime from the Scripture
+          Assistant panel.
         </p>
       </div>
     </div>

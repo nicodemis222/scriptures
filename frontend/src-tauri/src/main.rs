@@ -128,6 +128,9 @@ fn main() {
             tts::stop_reading,
             tts::is_reading,
             tts::tts_status,
+            tts::enhanced_voices_status,
+            tts::install_command_line_tools,
+            tts::setup_enhanced_voices,
             // AI + Ollama management
             ai::check_ollama_status,
             ai::check_ollama_installed,

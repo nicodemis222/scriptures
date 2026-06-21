@@ -68,6 +68,97 @@ fn pick_tts_port() -> u16 {
     TTS_PORT_DEFAULT
 }
 
+// ── TTS engine selection ──
+//
+// Read Aloud has two engines:
+//   • Piper (bundled neural voices) — preferred, but needs a python venv that
+//     only exists after the user opts into "enhanced voices".
+//   • macOS `say` — always present, zero dependencies, works offline on every
+//     Mac. This is the default so Read Aloud works on a clean Mac with NO
+//     python3, NO Xcode Command Line Tools, NO internet, and NO surprise modal.
+//
+// TTS_USE_SAY is set per playback by read_aloud*/. When true, synthesis uses
+// `say`; when false, Piper. Static (like TTS_PORT_ACTIVE) so the synth helper
+// doesn't have to thread it through.
+static TTS_USE_SAY: AtomicBool = AtomicBool::new(true);
+
+/// True only if Xcode Command Line Tools are installed — checked via
+/// `xcode-select -p` EXIT CODE, which does NOT invoke the python3/clang shim and
+/// therefore never pops Apple's "install developer tools" modal.
+fn clt_installed() -> bool {
+    Command::new("xcode-select")
+        .arg("-p")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// True if the Piper venv is already bootstrapped AND piper imports. Invokes
+/// the VENV's python (a real interpreter), never the system `python3` shim, so
+/// it's safe to call on a clean Mac (the venv path won't exist → returns false).
+fn piper_venv_ready() -> bool {
+    let venv_python = venv_python_path();
+    if !std::path::Path::new(&venv_python).exists() {
+        return false;
+    }
+    Command::new(&venv_python)
+        .args(["-c", "import piper"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Validate a macOS `say` voice name (e.g. "Samantha"). Curated voices are
+/// single tokens, so the strict alphanumeric rule is fine and keeps the value
+/// safe to pass to `say -v`.
+fn is_valid_say_voice(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_alphanumeric())
+}
+
+/// Curated macOS `say` voices to surface when Piper isn't set up. We probe
+/// `say -v '?'` and keep only single-token English voices that actually exist
+/// on this machine, so the picker never offers a voice `say` can't use.
+fn list_say_voices() -> Vec<Value> {
+    const PREFERRED: &[(&str, &str)] = &[
+        ("Samantha", "American English (female)"),
+        ("Alex", "American English (male)"),
+        ("Daniel", "British English (male)"),
+        ("Karen", "Australian English (female)"),
+        ("Moira", "Irish English (female)"),
+        ("Tessa", "South African English (female)"),
+        ("Rishi", "Indian English (male)"),
+    ];
+    let installed: String = Command::new("say")
+        .args(["-v", "?"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for (name, desc) in PREFERRED {
+        // `say -v '?'` lists "Name   locale  # sample" — match the leading token.
+        let present = installed
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some(*name));
+        if present {
+            out.push(json!({
+                "name": name,
+                "voice_id": name,
+                "description": desc,
+                "language": "en",
+                "locale": "say",
+                "engine": "say",
+            }));
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerseInput {
     pub id: i64,
@@ -286,25 +377,30 @@ fn spawn_piper_server() -> Option<Child> {
         .ok()
 }
 
-/// Start the Piper TTS server on app launch.
-/// Runs on a background thread so setup() returns immediately.
-pub fn start_piper_on_launch(tts: tauri::State<TtsState>, app_handle: tauri::AppHandle) {
-    // If OUR Piper is already running on the default port (e.g. relaunch after
-    // a crash where the orphan survived), reuse it instead of starting another.
+/// Start the Piper TTS server on app launch — ONLY if the user has already set
+/// up enhanced voices (the venv exists and piper imports).
+///
+/// CRITICAL: this must NEVER invoke the system `python3` to bootstrap a venv.
+/// On a clean Mac `/usr/bin/python3` is the Xcode CLT shim, and invoking it pops
+/// Apple's "install developer tools" modal with no context. So on first launch
+/// (no venv) we do nothing here and Read Aloud transparently uses macOS `say`.
+/// The venv is only ever created from the explicit, consent-gated
+/// `setup_enhanced_voices` command.
+pub fn start_piper_on_launch(tts: tauri::State<TtsState>, _app_handle: tauri::AppHandle) {
+    // Reuse our own Piper if it's already running (relaunch / orphan survivor).
     if is_our_piper(TTS_PORT_DEFAULT) {
         TTS_PORT_ACTIVE.store(TTS_PORT_DEFAULT, Ordering::Relaxed);
         return;
     }
 
-    // Clone the Arc so the spawned thread can write the child back into TtsState.
+    // Only auto-start when enhanced voices are already set up. Never bootstrap.
+    if !piper_venv_ready() {
+        eprintln!("[tts] Enhanced voices not set up; Read Aloud will use macOS 'say'.");
+        return;
+    }
+
     let server_handle: Arc<Mutex<Option<Child>>> = tts.piper_server.clone();
-
     std::thread::spawn(move || {
-        if let Err(e) = ensure_piper_venv(&app_handle) {
-            eprintln!("[tts] Failed to bootstrap piper venv: {}", e);
-            return;
-        }
-
         if let Some(child) = spawn_piper_server() {
             if let Ok(mut guard) = server_handle.lock() {
                 *guard = Some(child);
@@ -329,6 +425,80 @@ pub fn tts_status() -> Result<Value, String> {
             "bootstrapping"
         }
     }))
+}
+
+/// Status for the Settings "enhanced voices" panel. Lets the UI decide what to
+/// show WITHOUT ever invoking the python3 shim.
+#[tauri::command]
+pub fn enhanced_voices_status() -> Result<Value, String> {
+    Ok(json!({
+        "clt_installed": clt_installed(),
+        "venv_ready": piper_venv_ready(),
+        "server_running": piper_server_available(),
+        // The default engine is always macOS `say` until Piper is set up.
+        "active_engine": if piper_server_available() { "piper" } else { "say" },
+    }))
+}
+
+/// Open Apple's official Command Line Tools installer. This is the ONLY place we
+/// touch CLT, and only when the user explicitly clicks "Install" — so the system
+/// dialog appears WITH context (the user just asked for enhanced voices), never
+/// as a surprise. The actual install is driven by macOS, not us.
+#[tauri::command]
+pub fn install_command_line_tools() -> Result<Value, String> {
+    if clt_installed() {
+        return Ok(json!({"status": "already_installed"}));
+    }
+    Command::new("xcode-select")
+        .arg("--install")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("Could not open the installer: {}", e))?;
+    Ok(json!({"status": "installer_opened"}))
+}
+
+/// Explicit, consent-gated setup of Piper "enhanced voices". Only runs after the
+/// user clicks Set Up in Settings. Refuses (with a clear message) if Xcode CLT
+/// isn't present, so we never blindly invoke the python3 shim. Bootstraps the
+/// venv on a background thread and emits tts-setup-progress events.
+#[tauri::command]
+pub fn setup_enhanced_voices(
+    tts: State<TtsState>,
+    app_handle: tauri::AppHandle,
+) -> Result<Value, String> {
+    if piper_venv_ready() {
+        // Already set up — just (re)start the server.
+        if !piper_server_available() {
+            if let Some(child) = spawn_piper_server() {
+                if let Ok(mut guard) = tts.piper_server.lock() {
+                    *guard = Some(child);
+                }
+            }
+        }
+        return Ok(json!({"status": "already_ready"}));
+    }
+    if !clt_installed() {
+        return Err(
+            "Enhanced voices need Apple's Command Line Tools. Install them first, then try again."
+                .to_string(),
+        );
+    }
+
+    let server_handle: Arc<Mutex<Option<Child>>> = tts.piper_server.clone();
+    std::thread::spawn(move || {
+        // Safe: CLT is present, so `python3` resolves to a real interpreter.
+        if let Err(e) = ensure_piper_venv(&app_handle) {
+            eprintln!("[tts] enhanced-voices setup failed: {}", e);
+            return;
+        }
+        if let Some(child) = spawn_piper_server() {
+            if let Ok(mut guard) = server_handle.lock() {
+                *guard = Some(child);
+            }
+        }
+    });
+    Ok(json!({"status": "setting_up"}))
 }
 
 /// Validate voice ID: alphanumeric, hyphens, underscores only
@@ -427,8 +597,14 @@ fn split_into_sentences(text: &str) -> Vec<String> {
     sentences
 }
 
-/// Synthesize a single sentence via Piper HTTP API. Returns path to WAV file.
-fn synthesize_sentence(sentence: &str, voice: &str, index: usize) -> Option<String> {
+/// Synthesize a single sentence to an audio file. Uses Piper (neural) when
+/// TTS_USE_SAY is false, else macOS `say` (always available). Returns the path.
+/// `rate` is words-per-minute (applied by `say`; Piper rate is handled via the
+/// afplay playback rate in the caller).
+fn synthesize_sentence(sentence: &str, voice: &str, index: usize, rate: f32) -> Option<String> {
+    if TTS_USE_SAY.load(Ordering::Relaxed) {
+        return synthesize_say(sentence, voice, index, rate);
+    }
     let wav_path = format!("{}/chunk_{:04}.wav", PREFETCH_DIR, index);
     let body = json!({"text": sentence, "voice": voice});
 
@@ -463,10 +639,40 @@ fn synthesize_sentence(sentence: &str, voice: &str, index: usize) -> Option<Stri
     None
 }
 
+/// Synthesize a sentence with macOS `say` to an AIFF file (played via afplay).
+/// Zero dependencies — works on any Mac, offline. Voice is used only if it's a
+/// valid `say` voice name (Piper ids are ignored → system default voice).
+fn synthesize_say(sentence: &str, voice: &str, index: usize, rate: f32) -> Option<String> {
+    let aiff_path = format!("{}/chunk_{:04}.aiff", PREFETCH_DIR, index);
+    let _ = std::fs::remove_file(&aiff_path);
+    let wpm = (rate as i32).clamp(50, 500).to_string();
+
+    let mut cmd = Command::new("say");
+    // Default AIFF format — robust across macOS versions (explicit data-format
+    // strings vary and can fail). afplay handles the default fine.
+    cmd.args(["-r", &wpm, "-o", &aiff_path]);
+    if is_valid_say_voice(voice) {
+        cmd.args(["-v", voice]);
+    }
+    // Pass the text as a final argument (not stdin) — bounded by sentence split.
+    cmd.arg(sentence);
+
+    let status = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().ok()?;
+    if status.success() {
+        let size = std::fs::metadata(&aiff_path).map(|m| m.len()).unwrap_or(0);
+        if size > 256 {
+            return Some(aiff_path);
+        }
+    }
+    None
+}
+
 #[tauri::command]
 pub fn list_voices() -> Result<Value, String> {
+    // When Piper isn't running, offer macOS `say` voices so the picker still
+    // works on a clean Mac (Read Aloud falls back to `say`).
     if !piper_server_available() {
-        return Ok(json!([]));
+        return Ok(json!(list_say_voices()));
     }
 
     let output = Command::new("curl")
@@ -597,7 +803,13 @@ fn play_sentences(
     playing: Arc<AtomicBool>,
     process: Arc<Mutex<Option<Child>>>,
 ) {
-    let rate_mult = format!("{:.2}", rate / 175.0);
+    // In `say` mode the rate is baked into synthesis, so afplay plays at 1.0.
+    // In Piper mode afplay applies the rate multiplier.
+    let rate_mult = if TTS_USE_SAY.load(Ordering::Relaxed) {
+        "1.00".to_string()
+    } else {
+        format!("{:.2}", rate / 175.0)
+    };
     let _ = std::fs::create_dir_all(PREFETCH_DIR);
 
     for (i, sentence) in sentences.iter().enumerate() {
@@ -617,7 +829,7 @@ fn play_sentences(
         }
 
         // Synthesize
-        let wav_path = match synthesize_sentence(sentence, &voice, i) {
+        let wav_path = match synthesize_sentence(sentence, &voice, i, rate) {
             Some(p) => p,
             None => continue,
         };
@@ -703,10 +915,12 @@ pub fn read_aloud(
     tts.cancelled.store(false, Ordering::Relaxed);
     tts.paused.store(false, Ordering::Relaxed);
 
-    // Auto-start Piper server if not running
-    if !piper_server_available() && !auto_start_piper(&tts) {
-        return Err("Piper TTS server not available. Install it from Settings.".to_string());
-    }
+    // Pick engine: Piper if its server is up or can start from an already-set-up
+    // venv; otherwise macOS `say`. `say` is always available so Read Aloud never
+    // hard-fails — even on a clean Mac with no python3.
+    let use_piper =
+        piper_server_available() || (piper_venv_ready() && auto_start_piper(&tts));
+    TTS_USE_SAY.store(!use_piper, Ordering::Relaxed);
 
     let rate_val = rate.unwrap_or(175.0).clamp(50.0, 500.0);
     let voice_id = voice
@@ -755,9 +969,10 @@ pub fn read_aloud_verses(
     tts.paused.store(false, Ordering::Relaxed);
     tts.skip_to.store(-1, Ordering::Relaxed);
 
-    if !piper_server_available() && !auto_start_piper(&tts) {
-        return Err("Piper TTS server not available.".to_string());
-    }
+    // Pick engine (Piper if ready, else macOS `say` — always available).
+    let use_piper =
+        piper_server_available() || (piper_venv_ready() && auto_start_piper(&tts));
+    TTS_USE_SAY.store(!use_piper, Ordering::Relaxed);
 
     if verses.is_empty() {
         return Ok(());
@@ -797,7 +1012,11 @@ fn play_verses(
     skip_to: Arc<AtomicI64>,
     emitter: tauri::AppHandle,
 ) {
-    let rate_mult = format!("{:.2}", rate / 175.0);
+    let rate_mult = if TTS_USE_SAY.load(Ordering::Relaxed) {
+        "1.00".to_string()
+    } else {
+        format!("{:.2}", rate / 175.0)
+    };
     let _ = std::fs::create_dir_all(PREFETCH_DIR);
     let total = verses.len();
     let mut i = 0usize;
@@ -849,7 +1068,7 @@ fn play_verses(
         }));
 
         // Synthesize the entire verse as one audio chunk
-        let wav_path = match synthesize_sentence(&verse.text, &voice, i) {
+        let wav_path = match synthesize_sentence(&verse.text, &voice, i, rate) {
             Some(p) => p,
             None => { i += 1; continue; },
         };

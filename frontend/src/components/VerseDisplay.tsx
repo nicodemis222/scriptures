@@ -156,9 +156,17 @@ export function VerseDisplay({
         if (t.translated_text) map.set(t.verse_id, t.translated_text);
       }
       setTranslations(map);
-    } catch {
+    } catch (err) {
       setTranslations(new Map());
       setActiveLanguage(null);
+      const msg = err instanceof Error ? err.message : String(err);
+      // Give a useful hint when the failure is the AI engine/model not being set up.
+      showToast(
+        /engine|mistral|model|ollama/i.test(msg)
+          ? 'Translation needs the AI engine. Set it up in the Scripture Assistant.'
+          : 'Translation failed. Please try again.',
+        'error',
+      );
     } finally {
       setTranslating(false);
     }

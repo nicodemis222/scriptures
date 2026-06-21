@@ -45,8 +45,19 @@ fn call_ollama(endpoint: &str, body: &Value) -> Result<Value, String> {
     }
 
     let response_body = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&response_body)
-        .map_err(|e| format!("Failed to parse Ollama response: {}", e))
+    let parsed: Value = serde_json::from_str(&response_body)
+        .map_err(|e| format!("Failed to parse Ollama response: {}", e))?;
+
+    // Ollama returns HTTP 404 with {"error":"model '...' not found"} but curl
+    // still exits 0, so we must inspect the body. Without this, a missing model
+    // silently yields an empty response that callers mislabel as a result.
+    if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
+        if err.contains("not found") || err.contains("try pulling") {
+            return Err("The Mistral 7B model isn't installed yet. Set it up from the Scripture Assistant.".to_string());
+        }
+        return Err(format!("AI engine error: {}", err));
+    }
+    Ok(parsed)
 }
 
 /// Probe whether the responder on the Ollama port is actually Ollama
@@ -119,11 +130,15 @@ pub fn check_ollama_status() -> Result<Value, String> {
 
 /// Find the ollama binary, checking multiple locations.
 fn find_ollama() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
     let candidates = [
-        "/usr/local/bin/ollama",
-        "/opt/homebrew/bin/ollama",
-        "/Applications/Ollama.app/Contents/Resources/ollama",
-        "/Applications/Ollama.app/Contents/MacOS/Ollama",
+        "/usr/local/bin/ollama".to_string(),
+        "/opt/homebrew/bin/ollama".to_string(),
+        "/Applications/Ollama.app/Contents/Resources/ollama".to_string(),
+        "/Applications/Ollama.app/Contents/MacOS/Ollama".to_string(),
+        // Non-admin install fallback (~/Applications).
+        format!("{}/Applications/Ollama.app/Contents/Resources/ollama", home),
+        format!("{}/Applications/Ollama.app/Contents/MacOS/Ollama", home),
     ];
     // Check PATH first (only trust a path that actually exists on disk).
     if let Ok(output) = std::process::Command::new("which").arg("ollama").output() {
@@ -137,7 +152,7 @@ fn find_ollama() -> Option<String> {
     // Check known locations
     for path in &candidates {
         if std::path::Path::new(path).exists() {
-            return Some(path.to_string());
+            return Some(path.clone());
         }
     }
     None
@@ -171,8 +186,9 @@ pub fn install_ollama() -> Result<Value, String> {
             Ok(o) if o.status.success() => Ok(json!({"status": "installed", "method": "brew"})),
             _ => {
                 // Download Ollama.app directly (avoids sudo symlink issue).
-                // Use a .zip filename throughout, verify the archive looks like
-                // a zip before extracting, and surface real errors.
+                // Extract into /Applications if writable, else fall back to the
+                // user's ~/Applications so a standard (non-admin) user — who
+                // cannot write /Applications — still gets a working install.
                 let script = r#"
                     set -e
                     cd /tmp
@@ -185,8 +201,14 @@ pub fn install_ollama() -> Result<Value, String> {
                         rm -f ollama-darwin.zip
                         exit 1
                     fi
-                    rm -rf /Applications/Ollama.app
-                    unzip -o ollama-darwin.zip -d /Applications/ >/dev/null
+                    if [ -w /Applications ]; then
+                        DEST=/Applications
+                    else
+                        DEST="$HOME/Applications"
+                        mkdir -p "$DEST"
+                    fi
+                    rm -rf "$DEST/Ollama.app"
+                    unzip -o ollama-darwin.zip -d "$DEST/" >/dev/null
                     rm -f ollama-darwin.zip
                 "#;
                 let output = std::process::Command::new("sh")
@@ -202,9 +224,15 @@ pub fn install_ollama() -> Result<Value, String> {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     let detail = stderr.trim();
                     Err(if detail.is_empty() {
-                        "Install failed. Check your internet connection and try again.".to_string()
+                        "Could not install the AI engine automatically. You can install it \
+                         manually from ollama.com, then return here."
+                            .to_string()
                     } else {
-                        format!("Install failed: {}", detail)
+                        format!(
+                            "Could not install the AI engine: {}. You can install it manually \
+                             from ollama.com.",
+                            detail
+                        )
                     })
                 }
             }
@@ -301,7 +329,7 @@ pub fn pull_ollama_model(model: String, app_handle: tauri::AppHandle) -> Result<
             .stderr(std::process::Stdio::null())
             .spawn();
 
-        let child = match child {
+        let mut child = match child {
             Ok(c) => c,
             Err(e) => {
                 let _ = app_handle.emit("ollama-pull-progress", json!({
@@ -312,7 +340,7 @@ pub fn pull_ollama_model(model: String, app_handle: tauri::AppHandle) -> Result<
             }
         };
 
-        let stdout = match child.stdout {
+        let stdout = match child.stdout.take() {
             Some(s) => s,
             None => {
                 let _ = app_handle.emit("ollama-pull-progress", json!({
@@ -325,6 +353,10 @@ pub fn pull_ollama_model(model: String, app_handle: tauri::AppHandle) -> Result<
 
         let reader = std::io::BufReader::new(stdout);
         let mut last_pct: i64 = -1;
+        // Ollama emits {"status":"success"} as the final line of a complete pull.
+        // We only trust that — plus a clean curl exit — as success, so a dropped
+        // connection mid-download can't be reported as "Model ready".
+        let mut saw_success = false;
 
         for line in reader.lines() {
             let line = match line {
@@ -335,6 +367,9 @@ pub fn pull_ollama_model(model: String, app_handle: tauri::AppHandle) -> Result<
 
             if let Ok(data) = serde_json::from_str::<Value>(&line) {
                 let status_str = data.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                if status_str == "success" {
+                    saw_success = true;
+                }
                 let completed = data.get("completed").and_then(|v| v.as_u64()).unwrap_or(0);
                 let total = data.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
 
@@ -368,11 +403,22 @@ pub fn pull_ollama_model(model: String, app_handle: tauri::AppHandle) -> Result<
             }
         }
 
-        // Signal completion
-        let _ = app_handle.emit("ollama-pull-progress", json!({
-            "status": "success", "message": "Model ready!",
-            "percent": 100, "completed": 0, "total": 0,
-        }));
+        // The stream ended. Only declare success if Ollama sent its final
+        // "success" AND curl exited cleanly — otherwise the connection dropped
+        // mid-download and the model is incomplete.
+        let curl_ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        if saw_success && curl_ok {
+            let _ = app_handle.emit("ollama-pull-progress", json!({
+                "status": "success", "message": "Model ready!",
+                "percent": 100, "completed": 0, "total": 0,
+            }));
+        } else {
+            let _ = app_handle.emit("ollama-pull-progress", json!({
+                "status": "error",
+                "message": "Download interrupted. Check your internet connection and try again.",
+                "percent": 0, "completed": 0, "total": 0,
+            }));
+        }
     });
 
     // Return immediately — UI stays responsive
@@ -909,6 +955,13 @@ pub fn translate_chapter(
                 }
             }
         }
+    }
+
+    // If nothing parsed, the engine returned no usable translation (e.g. model
+    // missing or empty reply). Fail clearly instead of silently returning the
+    // original English text mislabeled as the target language.
+    if translated_map.is_empty() {
+        return Err("Translation didn't return any text. Make sure the AI engine and Mistral 7B are set up.".to_string());
     }
 
     {

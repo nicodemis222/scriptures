@@ -1,6 +1,78 @@
 import { useState, useEffect } from 'react';
-import { getSetting, setSetting } from '../hooks/useScriptures';
+import {
+  getSetting, setSetting,
+  enhancedVoicesStatus, installCommandLineTools, setupEnhancedVoices,
+  type EnhancedVoicesStatus,
+} from '../hooks/useScriptures';
 import { XIcon } from './Icons';
+
+/**
+ * Opt-in setup for Piper "enhanced" neural voices. Read Aloud already works via
+ * macOS `say` with zero setup; this lets the user upgrade to higher-quality
+ * voices. We NEVER auto-trigger this and never invoke the python3 shim — the
+ * status check and CLT install are explicit and consent-gated.
+ */
+function EnhancedVoices() {
+  const [status, setStatus] = useState<EnhancedVoicesStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const refresh = async () => {
+    try { setStatus(await enhancedVoicesStatus()); } catch { /* ignore */ }
+  };
+  useEffect(() => { void refresh(); }, []);
+
+  if (!status) return null;
+
+  if (status.server_running || status.venv_ready) {
+    return (
+      <p className="settings-note">
+        ✓ <strong>Enhanced neural voices</strong> are active. Read Aloud is using
+        the high-quality Piper voices.
+      </p>
+    );
+  }
+
+  const handleSetup = async () => {
+    setBusy(true); setMsg(null);
+    try {
+      if (!status.clt_installed) {
+        await installCommandLineTools();
+        setMsg('Apple’s installer was opened. Finish the install, then click “Set Up” again.');
+        setBusy(false);
+        void refresh();
+        return;
+      }
+      const r = await setupEnhancedVoices();
+      if (r.status === 'already_ready') {
+        setMsg('Enhanced voices are ready.');
+      } else {
+        setMsg('Setting up enhanced voices… progress shows in the banner above. This downloads ~220 MB and needs internet.');
+      }
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+      void refresh();
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 12 }}>
+      <p className="settings-note" style={{ marginBottom: 10 }}>
+        Read Aloud works now using your Mac&rsquo;s built-in voice. For higher-quality
+        <strong> neural voices</strong>, set up the optional enhanced engine
+        {status.clt_installed
+          ? ' (one-time ~220 MB download, needs internet).'
+          : '. This first needs Apple’s Command Line Tools.'}
+      </p>
+      <button className="settings-btn" onClick={() => void handleSetup()} disabled={busy}>
+        {busy ? 'Working…' : status.clt_installed ? 'Set Up Enhanced Voices' : 'Install Command Line Tools'}
+      </button>
+      {msg && <p className="settings-note" style={{ marginTop: 8 }}>{msg}</p>}
+    </div>
+  );
+}
 
 interface SettingsPanelProps {
   onClose: () => void;
@@ -146,6 +218,8 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
               onChange={(e) => handleTtsRateChange(parseInt(e.target.value, 10))}
             />
           </div>
+
+          <EnhancedVoices />
         </section>
 
         {/* AI Assistant */}

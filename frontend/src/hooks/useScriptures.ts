@@ -202,6 +202,25 @@ export async function ttsSetupStatus(): Promise<TtsSetupStatus> {
   return invoke('tts_status');
 }
 
+export interface EnhancedVoicesStatus {
+  clt_installed: boolean;
+  venv_ready: boolean;
+  server_running: boolean;
+  active_engine: 'piper' | 'say';
+}
+
+export async function enhancedVoicesStatus(): Promise<EnhancedVoicesStatus> {
+  return invoke('enhanced_voices_status');
+}
+
+export async function installCommandLineTools(): Promise<{ status: string }> {
+  return invoke('install_command_line_tools');
+}
+
+export async function setupEnhancedVoices(): Promise<{ status: string }> {
+  return invoke('setup_enhanced_voices');
+}
+
 // AI
 export async function checkOllamaStatus(): Promise<OllamaStatus> {
   return invoke('check_ollama_status');
