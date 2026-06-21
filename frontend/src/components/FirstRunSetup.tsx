@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { useEffect, useRef, useState } from 'react';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { checkOllamaInstalled, installOllama, startOllama, pullOllamaModel, checkOllamaStatus } from '../hooks/useScriptures';
 import { BrainIcon, BookOpen } from './Icons';
 
@@ -37,31 +37,49 @@ export function FirstRunSetup({ onComplete }: FirstRunSetupProps) {
   const [statusMsg, setStatusMsg] = useState('Checking system…');
   const [percent, setPercent] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const mountedRef = useRef(true);
 
-  // Listen for model pull progress
   useEffect(() => {
-    const unlisten = listen<{ status: string; message: string; percent: number }>('ollama-pull-progress', (event) => {
-      const { status: evtStatus, message, percent: pct } = event.payload;
-      if (pct > 0) setPercent(pct);
-      if (message) setStatusMsg(message);
-      if (evtStatus === 'success') {
-        setPercent(100);
-        setStatusMsg('Model ready!');
-        setStage('verifying');
-        void verifyAndFinish();
-      } else if (evtStatus === 'error') {
-        setError(message || 'Model download failed');
-        setStage('error');
-      }
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  // Listen for model pull progress.
+  // Guarded against unmount race: if the user clicks Skip / Continue in
+  // Background while the pull is still streaming, all setState/verifyAndFinish
+  // calls below short-circuit instead of touching unmounted state.
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let cancelled = false;
+    void listen<{ status: string; message: string; percent: number }>(
+      'ollama-pull-progress',
+      (event) => {
+        if (!mountedRef.current) return;
+        const { status: evtStatus, message, percent: pct } = event.payload;
+        if (pct > 0) setPercent(pct);
+        if (message) setStatusMsg(message);
+        if (evtStatus === 'success') {
+          setPercent(100);
+          setStatusMsg('Model ready!');
+          setStage('verifying');
+          void verifyAndFinish();
+        } else if (evtStatus === 'error') {
+          setError(message || 'Model download failed');
+          setStage('error');
+        }
+      },
+    ).then((fn) => {
+      if (cancelled) fn();
+      else unlisten = fn;
     });
-    return () => { unlisten.then((fn) => fn()); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return () => { cancelled = true; unlisten?.(); };
   }, []);
 
   useEffect(() => {
     void (async () => {
       try {
         const state = await getEngineState();
+        if (!mountedRef.current) return;
         setEngine(state);
         if (state.installed && state.running && state.hasModel) {
           setStage('done');
@@ -71,6 +89,7 @@ export function FirstRunSetup({ onComplete }: FirstRunSetupProps) {
           setStatusMsg('Ready to set up');
         }
       } catch {
+        if (!mountedRef.current) return;
         setStage('ready_to_install');
         setStatusMsg('Ready to set up');
       }
@@ -81,10 +100,12 @@ export function FirstRunSetup({ onComplete }: FirstRunSetupProps) {
     // Poll a few times to make sure Ollama actually has the model registered
     for (let i = 0; i < 10; i++) {
       await new Promise((r) => setTimeout(r, 1500));
+      if (!mountedRef.current) return;
       try {
         const status = await checkOllamaStatus();
         const hasModel = (status.models || []).some(m => m.name.startsWith('mistral'));
         if (hasModel) {
+          if (!mountedRef.current) return;
           setEngine(e => ({ ...e, running: true, hasModel: true }));
           setStage('done');
           setStatusMsg('Everything is ready!');
@@ -92,6 +113,7 @@ export function FirstRunSetup({ onComplete }: FirstRunSetupProps) {
         }
       } catch { /* retry */ }
     }
+    if (!mountedRef.current) return;
     setError('Model finished downloading but could not be verified. Try again or skip for now.');
     setStage('error');
   };
@@ -103,15 +125,18 @@ export function FirstRunSetup({ onComplete }: FirstRunSetupProps) {
     try {
       // Step 1: install Ollama if missing
       let state = await getEngineState();
+      if (!mountedRef.current) return;
       if (!state.installed) {
         setStage('installing');
         setStatusMsg('Installing AI engine… (one-time, ~150 MB)');
         const result = await installOllama();
+        if (!mountedRef.current) return;
         setStatusMsg(`AI engine installed (${result.method || 'ok'}).`);
       }
 
       // Step 2: start Ollama
       state = await getEngineState();
+      if (!mountedRef.current) return;
       if (!state.running) {
         setStage('starting');
         setStatusMsg('Starting AI engine…');
@@ -119,6 +144,7 @@ export function FirstRunSetup({ onComplete }: FirstRunSetupProps) {
         // wait up to 15s for API
         for (let i = 0; i < 15; i++) {
           await new Promise((r) => setTimeout(r, 1000));
+          if (!mountedRef.current) return;
           state = await getEngineState();
           if (state.running) break;
         }
@@ -129,6 +155,7 @@ export function FirstRunSetup({ onComplete }: FirstRunSetupProps) {
 
       // Step 3: pull model
       state = await getEngineState();
+      if (!mountedRef.current) return;
       if (!state.hasModel) {
         setStage('pulling');
         setStatusMsg(`Downloading ${MODEL_LABEL} (${MODEL_SIZE})…`);
@@ -140,6 +167,7 @@ export function FirstRunSetup({ onComplete }: FirstRunSetupProps) {
         void verifyAndFinish();
       }
     } catch (err) {
+      if (!mountedRef.current) return;
       setError(err instanceof Error ? err.message : String(err));
       setStage('error');
     }

@@ -1,9 +1,72 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter as _, State};
+
+/// Default port for the Piper TTS server. If occupied by a non-Piper
+/// process, we hop to the next free port in [8095..8105) — never killing
+/// strangers.
+const TTS_PORT_DEFAULT: u16 = 8095;
+const TTS_PORT_RANGE_END: u16 = 8105;
+
+/// The active TTS port, written once by `start_piper_on_launch` and read
+/// by every other tts.rs function via `tts_port()`. Static rather than
+/// State-bound so non-command helpers don't have to thread it through.
+static TTS_PORT_ACTIVE: AtomicU16 = AtomicU16::new(TTS_PORT_DEFAULT);
+
+fn tts_port() -> u16 {
+    TTS_PORT_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Probe a port via /health and return whether the responder is OUR Piper
+/// (i.e. it returned JSON with `"engine":"piper"`).
+fn is_our_piper(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{}/health", port);
+    let out = Command::new("curl")
+        .args(["-s", "--connect-timeout", "1", "--max-time", "2", &url])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let body = String::from_utf8_lossy(&o.stdout);
+            body.contains("\"engine\"") && body.contains("\"piper\"")
+        }
+        _ => false,
+    }
+}
+
+/// Returns true if no one is listening on the loopback port.
+///
+/// We probe by CONNECTING rather than binding: on macOS, binding a specific
+/// address (127.0.0.1) succeeds even when another process holds the wildcard
+/// (0.0.0.0) on the same port — so a bind-test would falsely report "free" for
+/// e.g. `python -m http.server`. A connect attempt to 127.0.0.1 is delivered to
+/// a wildcard listener too, so it reliably detects occupancy. ECONNREFUSED
+/// (connect fails fast) means free.
+fn port_is_free(port: u16) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    // Ok(_) = something accepted the connection → occupied; Err = refused/timeout → free.
+    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err()
+}
+
+/// Pick the port to use for Piper:
+/// 1. If 8095 already has OUR Piper running, reuse it.
+/// 2. Else find the first free port in [8095..8105).
+/// 3. Falls back to 8095 if everything is occupied (caller will surface the bind error).
+fn pick_tts_port() -> u16 {
+    if is_our_piper(TTS_PORT_DEFAULT) {
+        return TTS_PORT_DEFAULT;
+    }
+    for port in TTS_PORT_DEFAULT..TTS_PORT_RANGE_END {
+        if port_is_free(port) {
+            return port;
+        }
+    }
+    TTS_PORT_DEFAULT
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerseInput {
@@ -19,7 +82,8 @@ pub struct TtsState {
     /// Set to a verse index to skip to; -1 means no skip pending
     pub skip_to: Arc<AtomicI64>,
     pub prefetch: Mutex<Option<Child>>,
-    pub piper_server: Mutex<Option<Child>>,
+    /// Piper server child. Arc-wrapped so the spawn-on-launch thread can write to it.
+    pub piper_server: Arc<Mutex<Option<Child>>>,
 }
 
 impl TtsState {
@@ -31,24 +95,21 @@ impl TtsState {
             playing: Arc::new(AtomicBool::new(false)),
             skip_to: Arc::new(AtomicI64::new(-1)),
             prefetch: Mutex::new(None),
-            piper_server: Mutex::new(None),
+            piper_server: Arc::new(Mutex::new(None)),
         }
     }
 }
 
 impl Drop for TtsState {
     fn drop(&mut self) {
-        // Kill playback process (afplay)
+        // Kill playback process (afplay).
+        // NOTE: previously sent SIGKILL to -pid (process group). That was a
+        // serious bug — afplay is spawned without setsid/process_group, so it
+        // shares the Tauri parent's process group. Negative-pid kill would have
+        // signalled the entire app group, including the parent. We just kill
+        // the child here; the orphaned-afplay pkill below catches stragglers.
         if let Ok(mut guard) = self.process.lock() {
             if let Some(ref mut child) = *guard {
-                #[cfg(unix)]
-                {
-                    let pid = child.id();
-                    if pid <= i32::MAX as u32 {
-                        // SAFETY: kill process group so afplay children die too
-                        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
-                    }
-                }
                 let _ = child.kill();
             }
             *guard = None;
@@ -65,10 +126,12 @@ impl Drop for TtsState {
             }
             *guard = None;
         }
-        // Kill any orphaned afplay and Piper server
+        // Kill any orphaned afplay we may have left behind.
+        // NOTE: do NOT kill arbitrary listeners on tts_port() — that may belong
+        // to a totally unrelated process. Our spawned child is already killed above.
         let _ = Command::new("sh")
             .arg("-c")
-            .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null; lsof -ti:8095 | xargs kill -9 2>/dev/null")
+            .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -77,7 +140,6 @@ impl Drop for TtsState {
 }
 
 const PREFETCH_DIR: &str = "/tmp/scriptures_tts_chunks";
-const TTS_PORT: u16 = 8095;
 
 fn home_dir() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
@@ -181,7 +243,7 @@ fn ensure_piper_venv(emitter: &tauri::AppHandle) -> Result<(), String> {
     if !pip_output.status.success() {
         let stderr = String::from_utf8_lossy(&pip_output.stderr);
         let _ = std::fs::remove_dir_all(&venv_dir);
-        let msg = format!("Voice engine install failed. Check your internet connection.");
+        let msg = "Voice engine install failed. Check your internet connection.".to_string();
         eprintln!("[tts] pip install stderr: {}", stderr);
         let _ = emitter.emit("tts-setup-progress", json!({"stage": "error", "message": &msg, "percent": 0}));
         return Err(msg);
@@ -196,8 +258,9 @@ fn ensure_piper_venv(emitter: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Kill any stale process on the TTS port and spawn the Piper server.
-/// Returns the Child on success.
+/// Pick a free port and spawn the Piper server on it. NEVER kills foreign
+/// processes — if 8095 is taken by something else, we hop to 8096..8104.
+/// On success, updates `TTS_PORT_ACTIVE` and returns the Child.
 fn spawn_piper_server() -> Option<Child> {
     let (python, server_py, model_dir) = piper_server_paths();
     if server_py.is_empty() || !std::path::Path::new(&python).exists() {
@@ -205,14 +268,17 @@ fn spawn_piper_server() -> Option<Child> {
         return None;
     }
 
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!("lsof -ti:{} | xargs kill -9 2>/dev/null", TTS_PORT))
-        .output();
+    // If our Piper is already running on the default port, do not re-spawn —
+    // the caller checked piper_server_available() but a leftover from a prior
+    // session may exist that we don't own. Picking the next free port avoids
+    // colliding with it.
+    let port = pick_tts_port();
+    TTS_PORT_ACTIVE.store(port, Ordering::Relaxed);
+    eprintln!("[tts] Starting Piper server on port {}", port);
 
     Command::new(&python)
         .arg(&server_py)
-        .env("TTS_PORT", TTS_PORT.to_string())
+        .env("TTS_PORT", port.to_string())
         .env("MODEL_DIR", &model_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -223,24 +289,17 @@ fn spawn_piper_server() -> Option<Child> {
 /// Start the Piper TTS server on app launch.
 /// Runs on a background thread so setup() returns immediately.
 pub fn start_piper_on_launch(tts: tauri::State<TtsState>, app_handle: tauri::AppHandle) {
-    if piper_server_available() {
+    // If OUR Piper is already running on the default port (e.g. relaunch after
+    // a crash where the orphan survived), reuse it instead of starting another.
+    if is_our_piper(TTS_PORT_DEFAULT) {
+        TTS_PORT_ACTIVE.store(TTS_PORT_DEFAULT, Ordering::Relaxed);
         return;
     }
 
-    let server_mutex = tts.piper_server.lock().ok().is_some(); // verify mutex works
-    let _ = server_mutex;
-    // Clone the inner Arc-wrapped mutex so the background thread can store the child
-    let piper_server: Arc<Mutex<Option<Child>>> = {
-        // We need access to tts.piper_server from the thread.
-        // Since tts is a State (ref), we can't move it. Store the child via a shared Arc.
-        // Actually, piper_server is a plain Mutex — we'll just set it after thread completes.
-        // Instead, use a shared Arc that the thread writes to and we read back.
-        Arc::new(Mutex::new(None))
-    };
-    let server_handle = piper_server.clone();
+    // Clone the Arc so the spawned thread can write the child back into TtsState.
+    let server_handle: Arc<Mutex<Option<Child>>> = tts.piper_server.clone();
 
     std::thread::spawn(move || {
-        // Bootstrap venv (may take time on first launch, emits progress events)
         if let Err(e) = ensure_piper_venv(&app_handle) {
             eprintln!("[tts] Failed to bootstrap piper venv: {}", e);
             return;
@@ -287,7 +346,7 @@ fn piper_server_available() -> bool {
             "-s",
             "--connect-timeout",
             "1",
-            &format!("http://localhost:{}/health", TTS_PORT),
+            &format!("http://localhost:{}/health", tts_port()),
         ])
         .output()
         .map(|o| o.status.success())
@@ -382,7 +441,7 @@ fn synthesize_sentence(sentence: &str, voice: &str, index: usize) -> Option<Stri
             "30",
             "-X",
             "POST",
-            &format!("http://localhost:{}/synthesize", TTS_PORT),
+            &format!("http://localhost:{}/synthesize", tts_port()),
             "-H",
             "Content-Type: application/json",
             "-d",
@@ -415,7 +474,7 @@ pub fn list_voices() -> Result<Value, String> {
             "-s",
             "--connect-timeout",
             "2",
-            &format!("http://localhost:{}/voices", TTS_PORT),
+            &format!("http://localhost:{}/voices", tts_port()),
         ])
         .output()
         .map_err(|e| e.to_string())?;
@@ -486,7 +545,7 @@ pub fn prefetch_audio(
             "30",
             "-X",
             "POST",
-            &format!("http://localhost:{}/synthesize", TTS_PORT),
+            &format!("http://localhost:{}/synthesize", tts_port()),
             "-H",
             "Content-Type: application/json",
             "-d",
@@ -726,6 +785,7 @@ pub fn read_aloud_verses(
 
 /// Play verse-by-verse, emitting tts-verse-playing events for each verse.
 /// Supports skip_to for forward/back navigation.
+#[allow(clippy::too_many_arguments)]
 fn play_verses(
     verses: Vec<VerseInput>,
     voice: String,

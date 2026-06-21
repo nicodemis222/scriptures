@@ -3010,3 +3010,59 @@ body {
   padding-top: 16px;
   border-top: 1px solid rgba(139, 115, 85, 0.15);
 }
+
+/* ── AI setup primary button (in panel) ── */
+.ai-setup-primary-btn {
+  width: 100%;
+  padding: 12px;
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+}
+
+.ai-setup-primary-btn:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.ai-setup-primary-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* ── My Journey: light markdown rendering ── */
+.journey-md-h3 {
+  font-family: var(--font-serif-display, var(--font-serif));
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--accent);
+  margin: 18px 0 8px;
+}
+
+.journey-md-h4 {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 14px 0 6px;
+}
+
+.journey-md-p {
+  margin: 0 0 10px;
+  line-height: 1.7;
+}
+
+.journey-md-list {
+  margin: 0 0 12px;
+  padding-left: 20px;
+}
+
+.journey-md-list li {
+  margin-bottom: 6px;
+  line-height: 1.6;
+}

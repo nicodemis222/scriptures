@@ -3,11 +3,33 @@ use serde_json::{json, Value};
 use tauri::State;
 
 /// Sanitize FTS5 query input to prevent query syntax abuse.
-/// Wraps the input as a phrase query and caps length.
+/// Tokenizes on whitespace, quotes each token as a phrase, and ANDs them.
+/// `faith hope` becomes `"faith" AND "hope"` so verses containing both
+/// (in any order) match, while users cannot inject FTS5 operators.
+/// Falls back to a single quoted phrase if there are no tokens after split.
 pub fn sanitize_fts_query(q: &str) -> String {
     let trimmed: String = q.chars().take(500).collect();
-    let sanitized = trimmed.replace('"', "\"\"");
-    format!("\"{}\"", sanitized)
+    let tokens: Vec<String> = trimmed
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            // Strip characters FTS5 treats as syntax (quotes, parens, asterisk,
+            // colon, AND/OR/NOT can only be neutralised by quoting). We keep
+            // the token's letters, digits, and a small set of safe punctuation.
+            let safe: String = t
+                .chars()
+                .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '\'' | '&'))
+                .collect();
+            safe
+        })
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    if tokens.is_empty() {
+        // Empty after sanitisation — return a phrase that matches nothing safely.
+        return "\"\"".to_string();
+    }
+    tokens.join(" AND ")
 }
 
 #[tauri::command]
@@ -639,6 +661,12 @@ pub fn get_setting(db: State<DbState>, key: String) -> Result<Value, String> {
 #[tauri::command]
 pub fn set_setting(db: State<DbState>, key: String, value: String) -> Result<Value, String> {
     validate_setting_key(&key)?;
+    // Global upper bound so a misbehaving renderer can't fill the DB. journeyData
+    // (an AI study summary) is the only legitimately large value; cap at 256 KB.
+    let max_len = if key == "journeyData" { 256 * 1024 } else { 4096 };
+    if value.len() > max_len {
+        return Err(format!("Value too large for setting '{}'", key));
+    }
     // Validate specific setting values
     match key.as_str() {
         "fontSize" => {
@@ -653,14 +681,13 @@ pub fn set_setting(db: State<DbState>, key: String, value: String) -> Result<Val
                 return Err("TTS rate must be between 50 and 500".to_string());
             }
         }
-        "ttsVoice" => {
+        "ttsVoice"
             if value.len() > 100
                 || !value
                     .chars()
-                    .all(|c| c.is_alphanumeric() || " ()-._".contains(c))
-            {
-                return Err("Invalid voice name".to_string());
-            }
+                    .all(|c| c.is_alphanumeric() || " ()-._".contains(c)) =>
+        {
+            return Err("Invalid voice name".to_string());
         }
         _ => {} // theme, language — free text within the key allowlist
     }

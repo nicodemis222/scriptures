@@ -1,7 +1,66 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, type ReactNode } from 'react';
 import { getAllHighlights, getAllNotes, aiQuery, getSetting, setSetting } from '../hooks/useScriptures';
 import { BookOpen, BrainIcon, XIcon } from './Icons';
 import type { HighlightWithVerse, NoteWithVerse } from '../types/scriptures';
+
+/** Render inline **bold** within a line as React nodes (no raw HTML). */
+function renderInline(text: string): ReactNode[] {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={i}>{part.slice(2, -2)}</strong>;
+    }
+    return <span key={i}>{part}</span>;
+  });
+}
+
+/**
+ * Minimal, safe markdown renderer for the AI study summary. Handles ## / ###
+ * headings, bullet lists, and **bold** — everything else is plain text. Avoids
+ * literal "##" leaking into the UI without pulling in a markdown dependency or
+ * rendering raw HTML (so no XSS surface from model output).
+ */
+function renderJourneyMarkdown(md: string): ReactNode {
+  const lines = md.split('\n');
+  const blocks: ReactNode[] = [];
+  let list: string[] = [];
+  let key = 0;
+
+  const flushList = () => {
+    if (list.length) {
+      const items = list;
+      blocks.push(
+        <ul key={`ul-${key++}`} className="journey-md-list">
+          {items.map((it, i) => <li key={i}>{renderInline(it)}</li>)}
+        </ul>
+      );
+      list = [];
+    }
+  };
+
+  for (const raw of lines) {
+    const line = raw.trimEnd();
+    if (/^###\s+/.test(line)) {
+      flushList();
+      blocks.push(<h4 key={`h-${key++}`} className="journey-md-h4">{renderInline(line.replace(/^###\s+/, ''))}</h4>);
+    } else if (/^##\s+/.test(line)) {
+      flushList();
+      blocks.push(<h3 key={`h-${key++}`} className="journey-md-h3">{renderInline(line.replace(/^##\s+/, ''))}</h3>);
+    } else if (/^#\s+/.test(line)) {
+      flushList();
+      blocks.push(<h3 key={`h-${key++}`} className="journey-md-h3">{renderInline(line.replace(/^#\s+/, ''))}</h3>);
+    } else if (/^\s*[-*]\s+/.test(line)) {
+      list.push(line.replace(/^\s*[-*]\s+/, ''));
+    } else if (line.trim() === '') {
+      flushList();
+    } else {
+      flushList();
+      blocks.push(<p key={`p-${key++}`} className="journey-md-p">{renderInline(line)}</p>);
+    }
+  }
+  flushList();
+  return <>{blocks}</>;
+}
 
 interface MyJourneyProps {
   onClose: () => void;
@@ -159,9 +218,13 @@ Be encouraging, specific, and reverent.`;
   }, [saveJourney]);
 
   const handleScriptureClick = useCallback((text: string) => {
-    const match = text.match(/([\w\s]+?)\s+(\d+)/);
-    if (match) {
-      onNavigate(match[1].trim(), parseInt(match[2], 10));
+    // Parse a scripture reference, correctly handling leading-numbered book
+    // names like "1 Nephi 3", "2 Peter 1", "3 John 1" (the book name itself
+    // starts with a digit). Strategy: match an optional leading ordinal, then
+    // the book words, then the chapter number.
+    const m = text.match(/^\s*((?:[1-4]\s+)?[A-Za-z][A-Za-z.&\s]*?)\s+(\d+)(?::\d+)?\s*$/);
+    if (m) {
+      onNavigate(m[1].trim(), parseInt(m[2], 10));
     }
   }, [onNavigate]);
 
@@ -226,8 +289,8 @@ Be encouraging, specific, and reverent.`;
               </div>
             </div>
 
-            {/* AI Response */}
-            <div className="journey-content">{journey.response}</div>
+            {/* AI Response — rendered with light markdown (headings, bold) */}
+            <div className="journey-content">{renderJourneyMarkdown(journey.response)}</div>
 
             {/* Regenerate */}
             <div style={{ marginTop: 32, textAlign: 'center' }}>

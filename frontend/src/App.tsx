@@ -104,12 +104,28 @@ function App() {
     localStorage.setItem('setup_completed', 'true');
   };
 
-  // Dark mode
+  // Theme preference: 'light' | 'dark' | 'system'. The DOM only understands
+  // 'light'/'dark', so 'system' is resolved against the OS color scheme.
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'light');
 
   useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('theme', theme);
+
+    const apply = () => {
+      let resolved = theme;
+      if (theme === 'system') {
+        resolved = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+      document.documentElement.setAttribute('data-theme', resolved);
+    };
+    apply();
+
+    // When in system mode, follow OS changes live.
+    if (theme === 'system') {
+      const mq = window.matchMedia('(prefers-color-scheme: dark)');
+      mq.addEventListener('change', apply);
+      return () => mq.removeEventListener('change', apply);
+    }
   }, [theme]);
 
   useEffect(() => {
@@ -400,6 +416,13 @@ function App() {
   /* -- Volume title for breadcrumb -- */
   const volumeTitle = activeTab !== 'HYMNS' ? activeTab : undefined;
 
+  // Resolve whether the active theme renders dark (for the header toggle icon).
+  const isDark =
+    theme === 'dark' ||
+    (theme === 'system' &&
+      typeof window !== 'undefined' &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches);
+
   /* -- Render content area -- */
 
   const renderContent = () => {
@@ -554,10 +577,10 @@ function App() {
         <div className="header-actions">
           <button
             className="header-btn"
-            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-            title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            onClick={() => setTheme(isDark ? 'light' : 'dark')}
+            title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
           >
-            {theme === 'dark' ? <SunIcon size={18} /> : <MoonIcon size={18} />}
+            {isDark ? <SunIcon size={18} /> : <MoonIcon size={18} />}
           </button>
           <button
             className="header-btn"

@@ -175,6 +175,12 @@ export function VerseDisplay({
     if (!bookTitle || chapterNumber == null) return;
     let cancelled = false;
 
+    // Clear prior chapter's data immediately so a slow fetch can't let stale
+    // highlights/notes bleed onto the new chapter, and a fast (cached) new
+    // fetch can't be overwritten by a late old one.
+    setHighlights(new Map());
+    setNotes(new Map());
+
     (async () => {
       try {
         const [hl, nt] = await Promise.all([
@@ -405,7 +411,16 @@ export function VerseDisplay({
               <select
                 className="translate-select"
                 value={activeLanguage || ''}
-                onChange={(e) => void handleTranslate(e.target.value || 'English')}
+                onChange={(e) => {
+                  // Empty value = "English" = clear any active translation,
+                  // rather than round-tripping a doomed translate-to-English call.
+                  if (!e.target.value) {
+                    setTranslations(new Map());
+                    setActiveLanguage(null);
+                    return;
+                  }
+                  void handleTranslate(e.target.value);
+                }}
                 disabled={translating}
               >
                 <option value="">English</option>

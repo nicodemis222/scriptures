@@ -36,7 +36,7 @@ export function HymnViewer({ hymn, onBack }: HymnViewerProps) {
 
       {/* Verses */}
       <div className="hymn-verses">
-        {hymn.verses.map((v, _i) => (
+        {hymn.verses.map((v) => (
           <div
             key={`${v.verse_type}-${v.verse_number}`}
             className={`hymn-verse${v.verse_type === 'chorus' ? ' hymn-chorus' : ''}`}

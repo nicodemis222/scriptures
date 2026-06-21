@@ -28,38 +28,47 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
   const [ttsRate, setTtsRate] = useState(175);
 
   useEffect(() => {
-    loadSettings();
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [fs, lang, rate] = await Promise.all([
+          getSetting('fontSize'),
+          getSetting('language'),
+          getSetting('ttsRate'),
+        ]);
+        if (cancelled) return;
+        if (fs) setFontSize(parseInt(fs, 10));
+        if (lang) setLanguage(lang);
+        if (rate) setTtsRate(parseInt(rate, 10));
+      } catch (err) {
+        console.error('Failed to load settings:', err);
+      }
+    })();
+    return () => { cancelled = true; };
   }, []);
 
-  async function loadSettings() {
-    try {
-      const [fs, lang, rate] = await Promise.all([
-        getSetting('fontSize'),
-        getSetting('language'),
-        getSetting('ttsRate'),
-      ]);
-      if (fs) setFontSize(parseInt(fs, 10));
-      if (lang) setLanguage(lang);
-      if (rate) setTtsRate(parseInt(rate, 10));
-    } catch (err) {
-      console.error('Failed to load settings:', err);
-    }
+  // Persist a setting without leaving a floating promise (which can surface as
+  // an unhandled rejection). Failures are non-fatal — log and move on.
+  function persist(key: string, value: string) {
+    void setSetting(key, value).catch((err) => {
+      console.error(`Failed to save setting ${key}:`, err);
+    });
   }
 
   function handleFontSizeChange(size: number) {
     setFontSize(size);
     document.documentElement.style.setProperty('--verse-size', `${size}px`);
-    setSetting('fontSize', String(size));
+    persist('fontSize', String(size));
   }
 
   function handleLanguageChange(lang: string) {
     setLanguage(lang);
-    setSetting('language', lang);
+    persist('language', lang);
   }
 
   function handleTtsRateChange(rate: number) {
     setTtsRate(rate);
-    setSetting('ttsRate', String(rate));
+    persist('ttsRate', String(rate));
   }
 
   return (
@@ -161,7 +170,7 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
           </div>
 
           <div className="settings-about">
-            <p><strong>Scriptures</strong> v0.3.0</p>
+            <p><strong>Scriptures</strong> v0.4.0</p>
             <p>A complete offline scripture study companion with highlights, notes, and AI-powered insights.</p>
           </div>
         </section>

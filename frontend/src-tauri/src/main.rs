@@ -52,10 +52,12 @@ fn clear_caches_on_upgrade() {
     // Clear TTS temp files from previous sessions
     let _ = std::fs::remove_dir_all("/tmp/scriptures_tts_chunks");
 
-    // Kill any stale processes from old version
+    // Kill orphaned afplay we may have left behind. Do NOT touch port 8095 —
+    // it might be a totally unrelated process now. The TTS module probes for
+    // its own Piper instance and hops to a different port on conflict.
     let _ = std::process::Command::new("sh")
         .arg("-c")
-        .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null; lsof -ti:8095 | xargs kill -9 2>/dev/null")
+        .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null")
         .output();
 
     // Write current version
@@ -164,10 +166,11 @@ fn main() {
                         *srv = None;
                     }
                 }
-                // Kill any orphaned afplay and Piper server
+                // Kill orphaned afplay only — do NOT touch the TTS port. The
+                // Piper child was already killed via TtsState above.
                 let _ = std::process::Command::new("sh")
                     .arg("-c")
-                    .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null; lsof -ti:8095 | xargs kill -9 2>/dev/null")
+                    .arg("pkill -9 -f 'afplay.*/tmp/scriptures_tts_chunks' 2>/dev/null")
                     .status();
                 let _ = std::fs::remove_dir_all("/tmp/scriptures_tts_chunks");
             }

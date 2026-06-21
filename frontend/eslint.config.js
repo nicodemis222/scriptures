@@ -6,7 +6,7 @@ import tseslint from 'typescript-eslint'
 import { defineConfig, globalIgnores } from 'eslint/config'
 
 export default defineConfig([
-  globalIgnores(['dist']),
+  globalIgnores(['dist', 'src-tauri']),
   {
     files: ['**/*.{ts,tsx}'],
     extends: [
@@ -18,6 +18,14 @@ export default defineConfig([
     languageOptions: {
       ecmaVersion: 2020,
       globals: globals.browser,
+    },
+    rules: {
+      // React-compiler advisory rules: useful signal but flag many acceptable
+      // "reset state when inputs change" / loading-flag patterns. Keep as
+      // warnings so genuine errors (unused vars, type misuse) stay actionable.
+      'react-hooks/set-state-in-effect': 'warn',
+      'react-hooks/immutability': 'warn',
+      'react-refresh/only-export-components': 'warn',
     },
   },
 ])

@@ -8,9 +8,18 @@ use tauri::{Emitter as _, State};
 /// and Translation. Do not read from settings — this is intentionally fixed.
 pub const AI_MODEL: &str = "mistral:7b";
 
+/// Ollama's fixed local API port.
+const OLLAMA_PORT: u16 = 11434;
+
+fn ollama_url(endpoint: &str) -> String {
+    format!("http://localhost:{}{}", OLLAMA_PORT, endpoint)
+}
+
 /// Helper to call Ollama API via curl with proper timeouts.
+/// Caps response body at 64 MiB to bound memory if something on the port
+/// returns a huge/streaming body.
 fn call_ollama(endpoint: &str, body: &Value) -> Result<Value, String> {
-    let url = format!("http://localhost:11434{}", endpoint);
+    let url = ollama_url(endpoint);
     let output = std::process::Command::new("curl")
         .args([
             "-s",
@@ -18,6 +27,8 @@ fn call_ollama(endpoint: &str, body: &Value) -> Result<Value, String> {
             "5",
             "--max-time",
             "120",
+            "--max-filesize",
+            "67108864", // 64 MiB
             "-X",
             "POST",
             &url,
@@ -30,12 +41,48 @@ fn call_ollama(endpoint: &str, body: &Value) -> Result<Value, String> {
         .map_err(|e| format!("Failed to call Ollama: {}. Is curl installed?", e))?;
 
     if !output.status.success() {
-        return Err("Ollama request failed. Is Ollama running?".to_string());
+        return Err("Ollama request failed. Is the AI engine running?".to_string());
     }
 
     let response_body = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&response_body)
         .map_err(|e| format!("Failed to parse Ollama response: {}", e))
+}
+
+/// Probe whether the responder on the Ollama port is actually Ollama
+/// (returns JSON with a `models` array from /api/tags). Distinguishes "Ollama
+/// running" from "some other process squatting on 11434".
+fn ollama_responding() -> bool {
+    let output = std::process::Command::new("curl")
+        .args([
+            "-s",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "5",
+            &ollama_url("/api/tags"),
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let body = String::from_utf8_lossy(&out.stdout);
+            serde_json::from_str::<Value>(&body)
+                .map(|v| v.get("models").is_some())
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+/// Whether the port is occupied by SOMETHING that is not Ollama.
+/// Uses a connect-probe (not a bind-test): on macOS a specific-address bind can
+/// succeed alongside a wildcard listener, so bind would miss a foreign occupant.
+fn port_occupied_by_foreign(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let occupied = TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok();
+    occupied && !ollama_responding()
 }
 
 /// Check if Ollama is running and available
@@ -48,7 +95,7 @@ pub fn check_ollama_status() -> Result<Value, String> {
             "2",
             "--max-time",
             "5",
-            "http://localhost:11434/api/tags",
+            &ollama_url("/api/tags"),
         ])
         .output();
 
@@ -56,11 +103,12 @@ pub fn check_ollama_status() -> Result<Value, String> {
         Ok(out) if out.status.success() => {
             let body = String::from_utf8_lossy(&out.stdout);
             match serde_json::from_str::<Value>(&body) {
-                Ok(data) => Ok(json!({
+                Ok(data) if data.get("models").is_some() => Ok(json!({
                     "available": true,
                     "models": data.get("models").cloned().unwrap_or(json!([]))
                 })),
-                Err(_) => Ok(json!({"available": false, "models": []})),
+                // Port answered but not with Ollama-shaped JSON → foreign occupant.
+                _ => Ok(json!({"available": false, "models": [], "port_conflict": true})),
             }
         }
         _ => Ok(json!({"available": false, "models": []})),
@@ -75,12 +123,13 @@ fn find_ollama() -> Option<String> {
         "/usr/local/bin/ollama",
         "/opt/homebrew/bin/ollama",
         "/Applications/Ollama.app/Contents/Resources/ollama",
+        "/Applications/Ollama.app/Contents/MacOS/Ollama",
     ];
-    // Check PATH first
+    // Check PATH first (only trust a path that actually exists on disk).
     if let Ok(output) = std::process::Command::new("which").arg("ollama").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
+            if !path.is_empty() && std::path::Path::new(&path).exists() {
                 return Some(path);
             }
         }
@@ -95,18 +144,17 @@ fn find_ollama() -> Option<String> {
 }
 
 fn ollama_api_available() -> bool {
-    std::process::Command::new("curl")
-        .args(["-s", "--connect-timeout", "1", "http://localhost:11434/api/tags"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    ollama_responding()
 }
 
 #[tauri::command]
 pub fn check_ollama_installed() -> Result<Value, String> {
     let installed = find_ollama().is_some();
     let running = ollama_api_available();
-    Ok(json!({"installed": installed, "running": running}))
+    // Surface a foreign occupant on 11434 so the UI can show a clear message
+    // instead of looping on a failed start.
+    let port_conflict = !running && port_occupied_by_foreign(OLLAMA_PORT);
+    Ok(json!({"installed": installed, "running": running, "port_conflict": port_conflict}))
 }
 
 #[tauri::command]
@@ -122,16 +170,24 @@ pub fn install_ollama() -> Result<Value, String> {
         {
             Ok(o) if o.status.success() => Ok(json!({"status": "installed", "method": "brew"})),
             _ => {
-                // Download Ollama.app directly (avoids sudo symlink issue)
+                // Download Ollama.app directly (avoids sudo symlink issue).
+                // Use a .zip filename throughout, verify the archive looks like
+                // a zip before extracting, and surface real errors.
                 let script = r#"
+                    set -e
                     cd /tmp
-                    curl -fsSL -o ollama-darwin.tgz https://ollama.com/download/Ollama-darwin.zip 2>/dev/null \
-                    || curl -fsSL -o ollama-darwin.tgz https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip
-                    if [ -f ollama-darwin.tgz ]; then
-                        rm -rf /Applications/Ollama.app
-                        unzip -o ollama-darwin.tgz -d /Applications/ 2>/dev/null
-                        rm -f ollama-darwin.tgz
+                    rm -f ollama-darwin.zip
+                    curl -fsSL -o ollama-darwin.zip https://ollama.com/download/Ollama-darwin.zip \
+                    || curl -fsSL -o ollama-darwin.zip https://github.com/ollama/ollama/releases/latest/download/Ollama-darwin.zip
+                    # Reject HTML error pages / truncated downloads.
+                    if ! unzip -t ollama-darwin.zip >/dev/null 2>&1; then
+                        echo "Downloaded file is not a valid zip archive" >&2
+                        rm -f ollama-darwin.zip
+                        exit 1
                     fi
+                    rm -rf /Applications/Ollama.app
+                    unzip -o ollama-darwin.zip -d /Applications/ >/dev/null
+                    rm -f ollama-darwin.zip
                 "#;
                 let output = std::process::Command::new("sh")
                     .arg("-c")
@@ -140,13 +196,16 @@ pub fn install_ollama() -> Result<Value, String> {
                     .map_err(|e| format!("Install failed: {}", e))?;
 
                 // Verify it worked
-                if std::path::Path::new("/Applications/Ollama.app/Contents/Resources/ollama").exists() {
+                if find_ollama().is_some() {
                     Ok(json!({"status": "installed", "method": "direct"}))
                 } else {
-                    Err(format!(
-                        "Install failed: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    ))
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let detail = stderr.trim();
+                    Err(if detail.is_empty() {
+                        "Install failed. Check your internet connection and try again.".to_string()
+                    } else {
+                        format!("Install failed: {}", detail)
+                    })
                 }
             }
         }
@@ -160,20 +219,44 @@ pub fn start_ollama() -> Result<Value, String> {
     if ollama_api_available() {
         return Ok(json!({"status": "already_running"}));
     }
-    let ollama = find_ollama().ok_or("Ollama not found. Click Install first.")?;
-    let _child = std::process::Command::new(&ollama)
-        .arg("serve")
+    // Refuse to fight a foreign process squatting on the port.
+    if port_occupied_by_foreign(OLLAMA_PORT) {
+        return Err(format!(
+            "Port {} is in use by another application. Quit it and try again.",
+            OLLAMA_PORT
+        ));
+    }
+    let ollama = find_ollama().ok_or("AI engine not found. Install it first.")?;
+    // Detach into its own process group so it behaves as a daemon and is not
+    // signalled when our app exits (Ollama is a shared local service).
+    let mut cmd = std::process::Command::new(&ollama);
+    cmd.arg("serve")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to start: {}", e))?;
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    let running = ollama_api_available();
-    Ok(json!({"status": if running { "started" } else { "starting" }}))
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    cmd.spawn().map_err(|e| format!("Failed to start: {}", e))?;
+    // Poll for readiness (up to ~10s) instead of a fixed sleep.
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if ollama_api_available() {
+            return Ok(json!({"status": "started"}));
+        }
+    }
+    Ok(json!({"status": "starting"}))
 }
+
+/// Guards against two concurrent pulls of the model (e.g. user double-clicks
+/// or first-run setup overlaps the in-panel button). The second call returns
+/// early with `already_pulling`.
+static PULL_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[tauri::command]
 pub fn pull_ollama_model(model: String, app_handle: tauri::AppHandle) -> Result<Value, String> {
+    use std::sync::atomic::Ordering;
     if model.len() > 64
         || !model
             .chars()
@@ -182,18 +265,35 @@ pub fn pull_ollama_model(model: String, app_handle: tauri::AppHandle) -> Result<
         return Err("Invalid model name".to_string());
     }
 
+    // Dedup concurrent pulls.
+    if PULL_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(json!({"status": "already_pulling", "model": model}));
+    }
+
     // Spawn the download on a background thread so the UI stays responsive.
     // Progress is reported via ollama-pull-progress events.
     // Completion is signaled via ollama-pull-progress with status "success" or "error".
     let model_clone = model.clone();
     std::thread::spawn(move || {
+        // Clear the in-progress flag no matter how this thread exits.
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                PULL_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _guard = Guard;
+
         let child = std::process::Command::new("curl")
             .args([
                 "-sN",
                 "--connect-timeout", "10",
-                "--max-time", "900",
+                "--max-time", "1800",
                 "-X", "POST",
-                "http://localhost:11434/api/pull",
+                &ollama_url("/api/pull"),
                 "-H", "Content-Type: application/json",
                 "-d", &json!({"name": model_clone}).to_string(),
             ])
