@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { searchScriptures, searchHymns } from '../hooks/useScriptures';
+import { searchScriptures, searchHymns, resolveReference } from '../hooks/useScriptures';
 import type { SubTab } from '../data/constants';
 import type { VerseResult, HymnSummary } from '../types/scriptures';
 import { SearchIcon } from './Icons';
@@ -10,9 +10,10 @@ interface SearchBarProps {
   onVerseSelect: (verse: VerseResult) => void;
   onHymnSelect: (hymn: HymnSummary) => void;
   onSearchResults: (results: VerseResult[]) => void;
+  onNavigateReference: (book: string, chapter: number, verse?: number | null) => void;
 }
 
-export function SearchBar({ activeTab, onVerseSelect, onHymnSelect, onSearchResults }: SearchBarProps) {
+export function SearchBar({ activeTab, onVerseSelect, onHymnSelect, onSearchResults, onNavigateReference }: SearchBarProps) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<VerseResult[]>([]);
   const [hymnResults, setHymnResults] = useState<HymnSummary[]>([]);
@@ -50,6 +51,15 @@ export function SearchBar({ activeTab, onVerseSelect, onHymnSelect, onSearchResu
         setHymnResults(hymns);
         setShowDropdown(hymns.length > 0);
       } else {
+        // Go-to-reference: if the query looks like "Alma 32" / "John 3:16",
+        // jump straight to that chapter instead of a keyword search.
+        const ref = await resolveReference(q);
+        if (ref.found && ref.book_title && ref.chapter) {
+          onNavigateReference(ref.book_title, ref.chapter, ref.verse ?? null);
+          setShowDropdown(false);
+          setQuery('');
+          return;
+        }
         // Always search ALL scriptures globally — no volume filter
         const allVerses = await searchScriptures(q, undefined, 100);
         setResults(allVerses);
@@ -87,7 +97,7 @@ export function SearchBar({ activeTab, onVerseSelect, onHymnSelect, onSearchResu
           ref={inputRef}
           type="text"
           className="search-input"
-          placeholder="Search all scriptures..."
+          placeholder="Search, or jump to a reference (e.g. Alma 32, John 3:16)…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={handleKeyDown}

@@ -119,6 +119,139 @@ pub fn get_chapter(db: State<DbState>, book: String, chapter: i64) -> Result<Val
     Ok(json!(verses))
 }
 
+/// Resolve a free-text scripture reference like "Alma 32", "John 3:16",
+/// "1 Nephi 3:7", "D&C 76", or just "Genesis" into a canonical
+/// {found, book_title, chapter, verse, volume_title}. Powers go-to-reference:
+/// the search bar tries this BEFORE a keyword search so a reference jumps
+/// straight to the chapter. No regex crate needed — manual token parse.
+#[tauri::command]
+pub fn resolve_reference(db: State<DbState>, query: String) -> Result<Value, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(json!({"found": false}));
+    }
+
+    // Split trailing "<chapter>" or "<chapter>:<verse>" off the end.
+    let tokens: Vec<&str> = q.split_whitespace().collect();
+    let (book_part, chapter, verse): (String, i64, Option<i64>) = {
+        let last = *tokens.last().unwrap();
+        let parse_ch_vs = |s: &str| -> Option<(i64, Option<i64>)> {
+            let mut it = s.splitn(2, ':');
+            let ch = it.next()?.parse::<i64>().ok()?;
+            let vs = match it.next() {
+                Some(v) => Some(v.parse::<i64>().ok()?),
+                None => None,
+            };
+            Some((ch, vs))
+        };
+        if tokens.len() >= 2 {
+            if let Some((ch, vs)) = parse_ch_vs(last) {
+                (tokens[..tokens.len() - 1].join(" "), ch, vs)
+            } else {
+                // No trailing number → treat whole thing as a book, chapter 1.
+                (q.to_string(), 1, None)
+            }
+        } else if let Some((ch, _)) = parse_ch_vs(last) {
+            // A bare number alone isn't a reference.
+            let _ = ch;
+            return Ok(json!({"found": false}));
+        } else {
+            (q.to_string(), 1, None)
+        }
+    };
+
+    // Common aliases that prefix-matching won't catch.
+    let bp_lower = book_part.to_lowercase();
+    let alias = match bp_lower.as_str() {
+        "d&c" | "dc" | "d and c" => Some("Doctrine and Covenants"),
+        "jst" => Some("Joseph Smith Translation"),
+        _ => None,
+    };
+
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    // Match: exact (case-insensitive) first, then shortest title that starts
+    // with the query (so "Alma"→Alma, "1 Ne"→1 Nephi, "Gen"→Genesis).
+    let book_title: Option<String> = conn
+        .query_row(
+            "SELECT b.title FROM books b
+             WHERE LOWER(b.title) = LOWER(?1) OR LOWER(b.title) LIKE LOWER(?1) || '%'
+             ORDER BY (LOWER(b.title) = LOWER(?1)) DESC, LENGTH(b.title) ASC
+             LIMIT 1",
+            [alias.unwrap_or(book_part.as_str())],
+            |r| r.get(0),
+        )
+        .ok();
+
+    let book_title = match book_title {
+        Some(b) => b,
+        None => return Ok(json!({"found": false})),
+    };
+
+    // Verify the chapter exists for this book; grab its volume.
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT vol.title, c.chapter_number
+             FROM chapters c JOIN books b ON c.book_id = b.id
+             JOIN volumes vol ON b.volume_id = vol.id
+             WHERE b.title = ?1 AND c.chapter_number = ?2
+             LIMIT 1",
+            rusqlite::params![&book_title, chapter],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .ok();
+
+    match row {
+        Some((volume, ch)) => Ok(json!({
+            "found": true,
+            "book_title": book_title,
+            "chapter": ch,
+            "verse": verse,
+            "volume_title": volume,
+        })),
+        None => Ok(json!({"found": false})),
+    }
+}
+
+/// A deterministic "verse of the day" rotating through a curated list of
+/// well-known passages (changes daily, same for everyone on a given date).
+#[tauri::command]
+pub fn daily_verse(db: State<DbState>) -> Result<Value, String> {
+    const FEATURED: &[&str] = &[
+        "John 3:16", "Alma 32:21", "1 Nephi 3:7", "Proverbs 3:5", "Psalms 23:1",
+        "Matthew 11:28", "Moroni 10:4", "2 Nephi 2:25", "Philippians 4:13",
+        "Joshua 1:9", "Isaiah 40:31", "Romans 8:28", "Jeremiah 29:11",
+        "Mosiah 2:17", "Doctrine and Covenants 6:36", "Ether 12:27",
+        "Matthew 5:16", "Psalms 46:1", "Joshua 24:15", "3 Nephi 11:11",
+    ];
+    let conn = db.conn.lock().map_err(|e| e.to_string())?;
+    let day: i64 = conn
+        .query_row("SELECT CAST(julianday('now','localtime') AS INTEGER)", [], |r| r.get(0))
+        .unwrap_or(0);
+    let reference = FEATURED[(day.rem_euclid(FEATURED.len() as i64)) as usize];
+
+    conn.query_row(
+        "SELECT v.id, v.verse_number, v.text, v.reference, b.title, vol.title, c.chapter_number
+         FROM verses v
+         JOIN chapters c ON v.chapter_id = c.id
+         JOIN books b ON c.book_id = b.id
+         JOIN volumes vol ON b.volume_id = vol.id
+         WHERE v.reference = ?1 LIMIT 1",
+        [reference],
+        |row| {
+            Ok(json!({
+                "id": row.get::<_, i64>(0)?,
+                "verse_number": row.get::<_, i64>(1)?,
+                "text": row.get::<_, String>(2)?,
+                "reference": row.get::<_, Option<String>>(3)?,
+                "book_title": row.get::<_, String>(4)?,
+                "volume_title": row.get::<_, String>(5)?,
+                "chapter_number": row.get::<_, i64>(6)?,
+            }))
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn get_verse(
     db: State<DbState>,

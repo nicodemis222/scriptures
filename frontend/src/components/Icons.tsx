@@ -505,3 +505,40 @@ export const GoldDivider: React.FC<IconProps> = ({ size = 200, className }) => (
     <circle cx="185" cy="6" r="1" fill="currentColor" stroke="none" />
   </svg>
 );
+
+export const CopyIcon: React.FC<IconProps> = ({ size = 24, className }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.5}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+  >
+    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+    <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+  </svg>
+);
+
+export const ShareIcon: React.FC<IconProps> = ({ size = 24, className }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth={1.5}
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+  >
+    <circle cx="18" cy="5" r="3" />
+    <circle cx="6" cy="12" r="3" />
+    <circle cx="18" cy="19" r="3" />
+    <line x1="8.6" y1="13.5" x2="15.4" y2="17.5" />
+    <line x1="15.4" y1="6.5" x2="8.6" y2="10.5" />
+  </svg>
+);

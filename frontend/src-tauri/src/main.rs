@@ -87,6 +87,8 @@ fn main() {
             commands::get_books,
             commands::get_chapter,
             commands::get_verse,
+            commands::resolve_reference,
+            commands::daily_verse,
             commands::search_scriptures,
             // Hymn commands
             commands::get_hymns,

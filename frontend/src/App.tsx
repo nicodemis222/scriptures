@@ -13,18 +13,17 @@ import { SettingsPanel } from './components/SettingsPanel';
 import { MyJourney } from './components/MyJourney';
 import { AIAssistant } from './components/AIAssistant';
 import { FirstRunSetup } from './components/FirstRunSetup';
+import { WelcomeHome } from './components/WelcomeHome';
 import { ToastContainer } from './components/Toast';
 import {
   SunIcon,
   MoonIcon,
   BookmarkRibbon,
-  GlobeIcon,
-  SpeakerIcon,
   BrainIcon,
   GearIcon,
   BookOpen,
 } from './components/Icons';
-import { getBooks, getChapter, getHymns, getHymn, getSetting } from './hooks/useScriptures';
+import { getBooks, getChapter, getHymns, getHymn, getSetting, saveReadingProgress } from './hooks/useScriptures';
 import { SUBTAB_VOLUMES, FALLBACK_BOOKS, HYMNS_LIST, DEFAULT_TAB_ORDER } from './data/constants';
 import type { SubTab } from './data/constants';
 import type { BookInfo, VerseResult, HymnSummary, HymnDetail } from './types/scriptures';
@@ -44,6 +43,8 @@ function App() {
   const [selectedBook, setSelectedBook] = useState<BookInfo | null>(null);
   const [selectedChapter, setSelectedChapter] = useState<number | null>(null);
   const [verses, setVerses] = useState<VerseResult[]>([]);
+  // Verse number to scroll to + flash after navigating to a chapter (search/go-to-ref).
+  const [scrollVerse, setScrollVerse] = useState<number | null>(null);
   const [searchResults, setSearchResults] = useState<VerseResult[]>([]);
   const [viewMode, setViewMode] = useState<ViewMode>('books');
   const [loading, setLoading] = useState(false);
@@ -103,6 +104,13 @@ function App() {
     setShowFirstRunSetup(false);
     localStorage.setItem('setup_completed', 'true');
   };
+
+  // Remember the last chapter read so the home screen can offer "Continue reading".
+  useEffect(() => {
+    if (viewMode !== 'verses' || !selectedBook || selectedChapter == null) return;
+    void saveReadingProgress(String(activeTab), selectedBook.title, selectedChapter, null)
+      .catch(() => { /* non-fatal */ });
+  }, [viewMode, selectedBook, selectedChapter, activeTab]);
 
   // Theme preference: 'light' | 'dark' | 'system'. The DOM only understands
   // 'light'/'dark', so 'system' is resolved against the OS color scheme.
@@ -274,8 +282,16 @@ function App() {
   }, [selectedBook]);
 
   const handleVerseSelect = useCallback((verse: VerseResult) => {
+    // Open the FULL chapter scrolled to this verse (not an orphaned single verse).
+    if (verse.book_title && verse.chapter_number) {
+      void handleStudyNavigate(verse.book_title, verse.chapter_number, verse.verse_number);
+      return;
+    }
     setVerses([verse]);
     setViewMode('search');
+    // handleStudyNavigate is stable (defined below with [] deps); referencing it
+    // in deps here would TDZ at render time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleSearchResults = useCallback((results: VerseResult[]) => {
@@ -363,8 +379,9 @@ function App() {
     setError(null);
   };
 
-  // Navigate from study view to a specific chapter
-  const handleStudyNavigate = useCallback(async (bookTitle: string, chapter: number) => {
+  // Navigate to a specific chapter, optionally scrolling to + flashing a verse.
+  // Used by My Study, search results, and go-to-reference.
+  const handleStudyNavigate = useCallback(async (bookTitle: string, chapter: number, verse?: number | null) => {
     setViewMode('books'); // reset first
     setLoading(true);
     setError(null);
@@ -373,6 +390,7 @@ function App() {
       setVerses(chapterVerses);
       setSelectedChapter(chapter);
       setSelectedBook({ id: 0, title: bookTitle, abbreviation: null, long_title: null, num_chapters: null, book_order: null, volume_title: null });
+      setScrollVerse(verse ?? null);
       setViewMode('verses');
     } catch {
       setError('Unable to load chapter.');
@@ -380,6 +398,12 @@ function App() {
       setLoading(false);
     }
   }, []);
+
+  // Try to resolve a typed reference ("Alma 32", "John 3:16") and jump to it.
+  // Returns true if it resolved (so the search bar can skip keyword search).
+  const handleNavigateReference = useCallback(async (book: string, chapter: number, verse?: number | null) => {
+    await handleStudyNavigate(book, chapter, verse);
+  }, [handleStudyNavigate]);
 
   /* -- Hymn list as BookInfo for sidebar -- */
 
@@ -489,6 +513,8 @@ function App() {
           onVolumeClick={handleBackToBooks}
           onNextBook={handleNextBook}
           onPrevBook={handlePrevBook}
+          scrollToVerse={scrollVerse}
+          onScrolledToVerse={() => setScrollVerse(null)}
         />
       );
     }
@@ -555,17 +581,8 @@ function App() {
       );
     }
 
-    // Default: welcome
-    return (
-      <div className="content-area">
-        <div className="welcome">
-          <h2 className="welcome-title">Scripture Study</h2>
-          <p className="welcome-text">
-            "For the word of God is quick, and powerful, and sharper than any two-edged sword."
-          </p>
-        </div>
-      </div>
-    );
+    // Default: welcome home — verse of the day + continue reading
+    return <WelcomeHome onNavigate={handleStudyNavigate} />;
   };
 
   return (
@@ -588,12 +605,6 @@ function App() {
             title="My Study"
           >
             <BookmarkRibbon size={18} />
-          </button>
-          <button className="header-btn" disabled title="Read Aloud (use controls in verse view)">
-            <SpeakerIcon size={18} />
-          </button>
-          <button className="header-btn" disabled title="Language (coming soon)">
-            <GlobeIcon size={18} />
           </button>
           <button
             className="header-btn"
@@ -627,6 +638,7 @@ function App() {
             onVerseSelect={handleVerseSelect}
             onHymnSelect={handleHymnSelect}
             onSearchResults={handleSearchResults}
+            onNavigateReference={handleNavigateReference}
           />
         </div>
         <button className="journey-btn" onClick={() => setViewMode('journey')} title="My Journey">

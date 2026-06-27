@@ -1,4 +1,4 @@
-import { QuillPen, XIcon } from './Icons';
+import { QuillPen, XIcon, CopyIcon, ShareIcon } from './Icons';
 
 interface VerseToolbarProps {
   verseId: number;
@@ -7,6 +7,8 @@ interface VerseToolbarProps {
   onHighlight: (verseId: number, color: string) => void;
   onRemoveHighlight: (verseId: number) => void;
   onToggleNote: (verseId: number) => void;
+  onCopy: (verseId: number) => void;
+  onShare: (verseId: number) => void;
   onClose: () => void;
 }
 
@@ -25,6 +27,8 @@ export function VerseToolbar({
   onHighlight,
   onRemoveHighlight,
   onToggleNote,
+  onCopy,
+  onShare,
   onClose,
 }: VerseToolbarProps) {
   const handleColorClick = (color: string) => {
@@ -62,6 +66,22 @@ export function VerseToolbar({
         onClick={() => onToggleNote(verseId)}
       >
         <QuillPen size={18} />
+      </button>
+
+      <button
+        className="action-btn"
+        title="Copy verse"
+        onClick={() => onCopy(verseId)}
+      >
+        <CopyIcon size={17} />
+      </button>
+
+      <button
+        className="action-btn"
+        title="Share verse"
+        onClick={() => onShare(verseId)}
+      >
+        <ShareIcon size={17} />
       </button>
 
       <button

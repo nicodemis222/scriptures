@@ -40,6 +40,9 @@ interface VerseDisplayProps {
   onVolumeClick?: () => void;
   onNextBook?: () => void;
   onPrevBook?: () => void;
+  /** Verse number to scroll to + flash once the chapter loads (search / go-to-ref). */
+  scrollToVerse?: number | null;
+  onScrolledToVerse?: () => void;
 }
 
 function renderHighlightedText(text: string, verseHighlights: Highlight[]): React.ReactNode {
@@ -102,6 +105,8 @@ export function VerseDisplay({
   onVolumeClick,
   onNextBook,
   onPrevBook,
+  scrollToVerse,
+  onScrolledToVerse,
 }: VerseDisplayProps) {
   const [highlights, setHighlights] = useState<Map<number, Highlight[]>>(new Map());
   const [notes, setNotes] = useState<Map<number, Note>>(new Map());
@@ -212,6 +217,21 @@ export function VerseDisplay({
 
     return () => { cancelled = true; };
   }, [bookTitle, chapterNumber]);
+
+  // Scroll to + briefly flash a target verse after navigation (search / go-to-ref).
+  useEffect(() => {
+    if (scrollToVerse == null || verses.length === 0) return;
+    const t = setTimeout(() => {
+      const el = document.querySelector<HTMLElement>(`[data-verse-number="${scrollToVerse}"]`);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.add('verse-flash');
+        setTimeout(() => el.classList.remove('verse-flash'), 1800);
+      }
+      onScrolledToVerse?.();
+    }, 80);
+    return () => clearTimeout(t);
+  }, [scrollToVerse, verses, onScrolledToVerse]);
 
   // Text selection handler for sub-verse highlighting
   const handleMouseUp = useCallback(() => {
@@ -383,6 +403,53 @@ export function VerseDisplay({
     setEditingNoteVerseId(null);
   }, []);
 
+  // Build a clipboard/share payload for a verse, honoring any sub-selection.
+  const versePayload = useCallback((verseId: number): string | null => {
+    const v = verses.find((x) => x.id === verseId);
+    if (!v) return null;
+    const body = selectionRange?.text?.trim() || v.text;
+    const ref = (v.reference && v.reference.trim())
+      || `${bookTitle} ${v.chapter_number ?? chapterNumber ?? ''}:${v.verse_number ?? ''}`.trim();
+    return `${body} — ${ref}`;
+  }, [verses, selectionRange, bookTitle, chapterNumber]);
+
+  const closeToolbar = useCallback(() => {
+    setSelectedVerseId(null);
+    setSelectionRange(null);
+    setToolbarPosition(null);
+    window.getSelection()?.removeAllRanges();
+  }, []);
+
+  const handleCopyVerse = useCallback(async (verseId: number) => {
+    const payload = versePayload(verseId);
+    if (!payload) return;
+    try {
+      await navigator.clipboard.writeText(payload);
+      showToast(selectionRange ? 'Selection copied' : 'Verse copied', 'success');
+    } catch {
+      showToast('Could not copy to clipboard', 'error');
+    }
+    closeToolbar();
+  }, [versePayload, selectionRange, closeToolbar]);
+
+  const handleShareVerse = useCallback(async (verseId: number) => {
+    const payload = versePayload(verseId);
+    if (!payload) return;
+    try {
+      // Real share sheet where the platform supports it; clipboard fallback otherwise.
+      const nav = navigator as Navigator & { share?: (d: { text: string }) => Promise<void> };
+      if (typeof nav.share === 'function') {
+        await nav.share({ text: payload });
+      } else {
+        await navigator.clipboard.writeText(payload);
+        showToast('Copied — ready to share', 'success');
+      }
+    } catch {
+      /* user cancelled the share sheet, or it failed — no toast needed */
+    }
+    closeToolbar();
+  }, [versePayload, closeToolbar]);
+
   const headerText = chapterNumber ? `${bookTitle} ${chapterNumber}` : bookTitle;
 
   return (
@@ -464,6 +531,7 @@ export function VerseDisplay({
             <div key={v.id} style={{ position: 'relative' }}>
               <p
                 data-verse-id={v.id}
+                data-verse-number={v.verse_number ?? undefined}
                 data-verse-text={v.text}
                 className={`verse-line${readingVerseId === v.id ? ' verse-reading-current' : ''}`}
                 onClick={() => handleVerseClick(v.id)}
@@ -512,12 +580,9 @@ export function VerseDisplay({
                     onHighlight={handleHighlight}
                     onRemoveHighlight={handleRemoveHighlight}
                     onToggleNote={handleToggleNote}
-                    onClose={() => {
-                      setSelectedVerseId(null);
-                      setSelectionRange(null);
-                      setToolbarPosition(null);
-                      window.getSelection()?.removeAllRanges();
-                    }}
+                    onCopy={handleCopyVerse}
+                    onShare={handleShareVerse}
+                    onClose={closeToolbar}
                   />
                 </div>
               )}

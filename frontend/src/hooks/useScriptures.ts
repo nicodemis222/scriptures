@@ -21,6 +21,24 @@ export async function getVerse(book: string, chapter: number, verse: number): Pr
   return invoke('get_verse', { book, chapter, verse });
 }
 
+export interface ResolvedReference {
+  found: boolean;
+  book_title?: string;
+  chapter?: number;
+  verse?: number | null;
+  volume_title?: string;
+}
+
+/** Resolve "Alma 32", "John 3:16", "D&C 76" → a chapter to jump to. */
+export async function resolveReference(query: string): Promise<ResolvedReference> {
+  return invoke('resolve_reference', { query });
+}
+
+/** A curated verse-of-the-day (deterministic per calendar day). */
+export async function dailyVerse(): Promise<VerseResult> {
+  return invoke('daily_verse');
+}
+
 export async function searchScriptures(
   q: string,
   volume?: string,

@@ -99,13 +99,14 @@ const SLIDES: TutorialSlide[] = [
   },
   {
     title: 'Study Tools',
-    subtitle: 'Notes, bookmarks, and related talks',
+    subtitle: 'Copy, note, and explore related talks',
     description:
-      'Write notes on any verse with the quill icon. Below each chapter, discover related ' +
-      'General Conference talks from prophets and apostles, cross-referenced to the scripture you\'re reading.',
+      'Select any verse to copy or share it, highlight it, or write a note with the quill icon. ' +
+      'Below each chapter, discover related General Conference talks from prophets and apostles, ' +
+      'cross-referenced to the scripture you\'re reading.',
     icon: <QuillPen size={48} />,
     features: [
-      { icon: <QuillPen size={20} />, label: 'Write study notes on verses' },
+      { icon: <QuillPen size={20} />, label: 'Highlight, note, copy & share verses' },
       { icon: <BookmarkRibbon size={20} />, label: 'My Study — review all highlights & notes' },
       { icon: <BookOpen size={20} />, label: 'Related talks from prophets & leaders' },
     ],

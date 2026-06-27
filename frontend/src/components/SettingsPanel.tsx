@@ -244,7 +244,7 @@ export function SettingsPanel({ onClose, theme, onThemeChange, onShowTutorial }:
           </div>
 
           <div className="settings-about">
-            <p><strong>Scriptures</strong> v0.4.0</p>
+            <p><strong>Scriptures</strong> v0.5.0</p>
             <p>A complete offline scripture study companion with highlights, notes, and AI-powered insights.</p>
           </div>
         </section>
