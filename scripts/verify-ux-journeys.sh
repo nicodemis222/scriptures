@@ -87,7 +87,11 @@ grep -q "WelcomeHome" "$SRC/App.tsx" && grep -q "getReadingProgress" "$SRC/compo
 sec "Journey 8 — Content completeness (all 9 canons present)"
 vols=$(q "SELECT COUNT(DISTINCT v.id) FROM volumes v JOIN books b ON b.volume_id=v.id JOIN chapters c ON c.book_id=b.id JOIN verses ve ON ve.chapter_id=c.id;")
 [ "${vols:-0}" -ge 9 ] && ok "$vols volumes have readable content" || bad "only $vols volumes have content (expected ≥9)"
-empty=$(q "SELECT COUNT(*) FROM (SELECT b.id FROM books b JOIN chapters c ON c.book_id=b.id JOIN verses ve ON ve.chapter_id=c.id GROUP BY b.id HAVING COUNT(ve.id)=0);")
+awv=$(q "SELECT COUNT(ve.id) FROM verses ve JOIN volumes v ON ve.volume_id=v.id WHERE v.title='Ancient Witnesses';")
+[ "${awv:-0}" -ge 500 ] && ok "Ancient Witnesses has substantive content ($awv verses)" || bad "Ancient Witnesses too thin ($awv verses)"
+clem=$(q "SELECT COUNT(*) FROM verses WHERE book_id=(SELECT id FROM books WHERE title='1 Clement');")
+[ "${clem:-0}" -gt 100 ] && ok "1 Clement filled ($clem verses)" || bad "1 Clement still thin/empty ($clem)"
+empty=$(q "SELECT COUNT(*) FROM books b WHERE (SELECT COUNT(*) FROM verses WHERE book_id=b.id)=0;")
 [ "${empty:-0}" = "0" ] && ok "no empty books" || bad "$empty books have zero verses"
 
 printf "\n\033[1mRESULT: %d passed, %d failed\033[0m\n" "$PASS" "$FAIL"
